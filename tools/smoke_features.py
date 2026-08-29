@@ -8,6 +8,7 @@ are exercised rather than just the data layer underneath them.
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import tempfile
 from datetime import date, timedelta
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from expman import csvio  # noqa: E402
 from expman.app import MainWindow  # noqa: E402
-from expman.db import Database  # noqa: E402
+from expman.db import SCHEMA_VERSION, Database  # noqa: E402
 from expman.import_dialog import ImportDialog  # noqa: E402
 from expman.money import format_cents  # noqa: E402
 from expman.pages import goals as goals_page  # noqa: E402
@@ -389,6 +390,47 @@ def main() -> int:
     )
     check("goals fall back to the empty state", page.stack.currentIndex() == 1)
 
+    # Goals are listed by name, so one added out of alphabetical order shifts
+    # every goal after it along a cell. Tiles that stayed put would share a cell
+    # and hide one another, leaving a goal counted but never drawn.
+    for name in ("Bike", "Camera", "Desk", "Sofa"):
+        goals_page.GoalDialog = StubDialog(
+            {"name": name, "target_cents": 100000, "allocation_pct": 0.0, "notes": ""}
+        )
+        page.add_goal()
+    goals_page.GoalDialog = StubDialog(
+        {"name": "Amp", "target_cents": 100000, "allocation_pct": 0.0, "notes": ""}
+    )
+    page.add_goal()
+    cells = {}
+    for goal in db.goals():
+        tile = page.tiles[goal["id"]]
+        at = page.grid.indexOf(tile)
+        cells[goal["name"]] = (
+            page.grid.getItemPosition(at)[:2] if at != -1 else None
+        )
+    check("every goal has a tile in the grid", None not in cells.values(), str(cells))
+    check(
+        "no two goals share a cell",
+        len(set(cells.values())) == len(cells),
+        str(cells),
+    )
+    check(
+        "a goal inserted first takes the first cell",
+        cells.get("Amp") == (0, 0),
+        str(cells),
+    )
+    check(
+        "the footer counts what is on screen",
+        page.summary.text().startswith("5 goals"),
+        page.summary.text(),
+    )
+
+    for goal in db.goals():
+        page.selected_id = goal["id"]
+        page.delete_selected()
+    check("goals cleared again", db.goals() == [])
+
     # ------------------------------------------------- setting aside from income
     print("\nIncome to goals")
     alloc_db = Database(os.path.join(workdir, "alloc.db"))
@@ -470,6 +512,79 @@ def main() -> int:
           str(alloc_db.total_allocation_pct()))
     check("median income is available for the hint", alloc_db.typical_income() == 100000,
           str(alloc_db.typical_income()))
+
+    # ---------------------------------------------- a file from an older build
+    print("\nOpening a database from an older build")
+    # Before goals could take a share of income, goal_contributions had no
+    # income_id; it arrives by ALTER TABLE, which cannot carry ON DELETE CASCADE
+    # with it. That left the reference enforced but inert, so deleting an income
+    # entry that had fed a goal failed on the constraint instead of taking its
+    # contributions with it -- on the income page, a delete that did nothing.
+    legacy_path = os.path.join(workdir, "legacy.db")
+    legacy = Database(legacy_path)
+    legacy_goal = legacy.add_goal("Old goal", 100000, allocation_pct=10)
+    legacy_income = legacy.add_income(date(2026, 7, 1), 200000, "Salary", "old pay")
+    legacy.add_contribution(legacy_goal, date(2026, 7, 2), 5000, "by hand")
+    legacy.conn.executescript(
+        """
+        PRAGMA foreign_keys = OFF;
+        ALTER TABLE goal_contributions RENAME TO goal_contributions_old;
+        CREATE TABLE goal_contributions (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            goal_id        INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            made_on        TEXT    NOT NULL,
+            amount_cents   INTEGER NOT NULL,
+            note           TEXT    NOT NULL DEFAULT '',
+            created_at     TEXT    NOT NULL,
+            income_id      INTEGER REFERENCES income(id),
+            allocation_pct REAL    NOT NULL DEFAULT 0
+        );
+        INSERT INTO goal_contributions (id, goal_id, made_on, amount_cents, note,
+                                        created_at, income_id, allocation_pct)
+             SELECT id, goal_id, made_on, amount_cents, note,
+                    created_at, income_id, allocation_pct
+               FROM goal_contributions_old;
+        DROP TABLE goal_contributions_old;
+        """
+    )
+    legacy.conn.commit()
+    legacy.close()
+
+    stale = sqlite3.connect(legacy_path)
+    try:
+        stale.execute("PRAGMA foreign_keys = ON")
+        stale.execute("DELETE FROM income WHERE id = ?", (legacy_income,))
+        blocked = False
+    except sqlite3.IntegrityError:
+        blocked = True
+    finally:
+        stale.close()
+    check("the old shape is the one that blocked deletes", blocked)
+
+    repaired = Database(legacy_path)
+    cascades = {
+        row["table"]: row["on_delete"]
+        for row in repaired.conn.execute("PRAGMA foreign_key_list(goal_contributions)")
+    }
+    check("opening it puts the cascade back", cascades.get("income") == "CASCADE",
+          str(cascades))
+    check(
+        "money already set aside survives the rebuild",
+        repaired.get_goal(legacy_goal)["saved_cents"] == 20000 + 5000,
+        str(repaired.get_goal(legacy_goal)["saved_cents"]),
+    )
+    check("the file reports the newer schema version",
+          repaired.get_setting("schema_version") == SCHEMA_VERSION,
+          repaired.get_setting("schema_version"))
+    check("income from an older file deletes", repaired.delete_income([legacy_income]) == 1)
+    check(
+        "and takes only its own share with it",
+        repaired.get_goal(legacy_goal)["saved_cents"] == 5000,
+        str(repaired.get_goal(legacy_goal)["saved_cents"]),
+    )
+    check("the file is left consistent",
+          repaired.conn.execute("PRAGMA foreign_key_check").fetchall() == [])
+    repaired.close()
 
     # ------------------------------------------------------------ first paint
     print("\nLanding page")

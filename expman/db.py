@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .recurrence import advance
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 DEFAULT_CATEGORIES = [
     "Groceries",
@@ -107,7 +107,13 @@ CREATE TABLE IF NOT EXISTS goals (
     created_at     TEXT    NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS goal_contributions (
+"""
+
+# Kept apart from the script above because an old database has to have this
+# table rebuilt around its constraints, and a second copy of the definition
+# would be one refresh away from disagreeing with this one.
+_CONTRIBUTIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS {name} (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     goal_id      INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
     made_on      TEXT    NOT NULL,
@@ -122,9 +128,9 @@ CREATE TABLE IF NOT EXISTS goal_contributions (
     allocation_pct REAL NOT NULL DEFAULT 0,
     created_at   TEXT    NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_contributions_goal ON goal_contributions(goal_id);
 """
+
+_SCHEMA += _CONTRIBUTIONS_TABLE.format(name="goal_contributions")
 
 # A subscription back-dated by years would otherwise post thousands of rows.
 _MAX_CATCHUP_POSTINGS = 520
@@ -177,13 +183,83 @@ class Database:
             if column not in existing:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
 
+        self._cascade_contributions_from_income()
+
         # Indexed here rather than in the schema script, which runs before the
-        # column above exists on a database created by an earlier version.
+        # column above exists on a database created by an earlier version -- and
+        # after the rebuild above, which takes the old table's indexes with it.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_contributions_goal "
+            "ON goal_contributions(goal_id)"
+        )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_contributions_income "
             "ON goal_contributions(income_id)"
         )
+        # _seed only ever inserts, so a database carried forward from an older
+        # build would otherwise keep reporting the version it was created at.
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (SCHEMA_VERSION,),
+        )
         self.conn.commit()
+
+    def _cascade_contributions_from_income(self) -> None:
+        """Give goal_contributions.income_id the cascade it was declared with.
+
+        The column arrives by ALTER TABLE on every database created before goals
+        could take a share of income, and ALTER TABLE ADD COLUMN cannot carry a
+        cascade with it. What is left is a reference that is enforced but never
+        acts: with foreign keys on, deleting an income entry that fed a goal
+        fails on the constraint instead of taking its contributions with it, and
+        from the income page the delete looks like it simply did nothing.
+
+        SQLite cannot alter a constraint, so the table is rebuilt around it.
+        """
+        income_fk = next(
+            (
+                row
+                for row in self.conn.execute(
+                    "PRAGMA foreign_key_list(goal_contributions)"
+                )
+                if row["table"] == "income"
+            ),
+            None,
+        )
+        if income_fk is not None and income_fk["on_delete"] == "CASCADE":
+            return
+
+        # The pragma is ignored inside a transaction, and the swap would trip
+        # the very constraint being repaired while rows still point at the old
+        # table. Both mean the rebuild has to start from a clean connection.
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self.conn.execute(
+                _CONTRIBUTIONS_TABLE.format(name="goal_contributions_new")
+            )
+            # A contribution can only outlive its income on a database where the
+            # reference went unenforced. The cascade it should always have had is
+            # applied to it here rather than leaving a row nothing can explain.
+            self.conn.execute(
+                "INSERT INTO goal_contributions_new "
+                "(id, goal_id, made_on, amount_cents, note, income_id, "
+                " allocation_pct, created_at) "
+                "SELECT id, goal_id, made_on, amount_cents, note, income_id, "
+                "       allocation_pct, created_at FROM goal_contributions "
+                " WHERE income_id IS NULL OR income_id IN (SELECT id FROM income)"
+            )
+            self.conn.execute("DROP TABLE goal_contributions")
+            self.conn.execute(
+                "ALTER TABLE goal_contributions_new RENAME TO goal_contributions"
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            self.conn.execute("PRAGMA foreign_keys = ON")
 
     def _seed(self) -> None:
         for key, value in DEFAULT_SETTINGS.items():
