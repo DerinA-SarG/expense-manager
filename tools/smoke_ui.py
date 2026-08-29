@@ -18,6 +18,7 @@ from PySide6.QtCore import QCoreApplication, QEventLoop, Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from expman import dialogs as dialogs_module  # noqa: E402
+from expman import updates  # noqa: E402
 from expman.app import MainWindow  # noqa: E402
 from expman.db import Database  # noqa: E402
 from expman.money import format_cents  # noqa: E402
@@ -237,6 +238,78 @@ def main() -> int:
     for index in range(3):
         window._navigate(index)
     check("all pages navigate", window.stack.currentIndex() == 2)
+
+    print("\nGoals")
+    goals = window.goals
+    doomed = db.add_goal("Old plan", 100000, allocation_pct=30)
+    keeper = db.add_goal("Keeper", 500000, allocation_pct=10)
+    db.add_contribution(doomed, date.today(), 6000, "saved up")
+    goals.refresh()
+    goals._select(doomed)
+
+    QMessageBox.exec = stub_confirm(checked=False)
+    total_before = sum(g["saved_cents"] for g in db.goals())
+    goals.delete_selected()
+    check("a goal deletes", db.get_goal(doomed) is None)
+    check(
+        "and without the box its money goes with it",
+        sum(g["saved_cents"] for g in db.goals()) == total_before - 6000,
+        str([(g["name"], g["saved_cents"]) for g in db.goals()]),
+    )
+
+    doomed = db.add_goal("Second thoughts", 100000, allocation_pct=30)
+    db.add_contribution(doomed, date.today(), 6000, "saved up")
+    goals.refresh()
+    goals._select(doomed)
+    total_before = sum(g["saved_cents"] for g in db.goals())
+    QMessageBox.exec = stub_confirm(checked=True)
+    goals.delete_selected()
+    check("ticking the box keeps the money",
+          sum(g["saved_cents"] for g in db.goals()) == total_before,
+          str([(g["name"], g["saved_cents"]) for g in db.goals()]))
+    check("it lands in the goal that takes a share",
+          db.get_goal(keeper)["saved_cents"] == 6000,
+          str(db.get_goal(keeper)["saved_cents"]))
+    check("and no income entry appears for it", db.income_total() == 0)
+
+    # ---------------------------------------------------------------- updates
+    print("\nUpdates")
+    # No network is touched: the handler is handed the answers a check would
+    # have returned, which is the half that has to read correctly.
+    said = []
+    plain_information = QMessageBox.information
+    plain_warning = QMessageBox.warning
+    QMessageBox.information = lambda parent, title, text: said.append(text)
+    QMessageBox.warning = lambda parent, title, text: said.append(text)
+
+    names = [action.text() for action in window._settings_menu().actions()]
+    check("settings offers a check for updates", "Check for updates..." in names, str(names))
+
+    window._update_answer(
+        updates.Update(branch="main", behind=0, ahead=0, dirty=False, subjects=())
+    )
+    check("an up-to-date copy says so", said[-1] == "This copy is up to date.", said[-1])
+
+    window._update_answer(
+        updates.Update(branch="main", behind=0, ahead=2, dirty=False, subjects=())
+    )
+    check("unpushed work is mentioned", "have not been pushed" in said[-1], said[-1])
+
+    window._update_answer(updates.GitUnavailable("Git is not installed."))
+    check("a failed check explains itself", said[-1] == "Git is not installed.", said[-1])
+
+    before = len(said)
+    # Turning the offer down must not reach for git at all -- an accepted one
+    # would fast-forward this very checkout, which is not a test's business.
+    QMessageBox.exec = stub_confirm(monkey_yes=False)
+    window._update_answer(
+        updates.Update(branch="main", behind=2, ahead=0, dirty=True,
+                       subjects=("one", "two"))
+    )
+    check("declining an update pulls nothing", len(said) == before, str(said[before:]))
+
+    QMessageBox.information = plain_information
+    QMessageBox.warning = plain_warning
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
