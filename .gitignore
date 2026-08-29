@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+
+# virtualenvs
+.venv/
+venv/
+
+# local databases and backups — never commit spending data
+*.db
+*.db-journal
+*-backup-*.db
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

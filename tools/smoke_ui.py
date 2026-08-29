@@ -1,0 +1,250 @@
+"""Drive the real UI handlers with stubbed dialogs.
+
+Rendering proves the pages lay out; this proves the buttons actually work --
+add / edit / delete, subscription posting, filters, theme and currency changes.
+
+    python tools/smoke_ui.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+from datetime import date, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from PySide6.QtCore import QCoreApplication, QEventLoop, Qt  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+
+from expman import dialogs as dialogs_module  # noqa: E402
+from expman.app import MainWindow  # noqa: E402
+from expman.db import Database  # noqa: E402
+from expman.money import format_cents  # noqa: E402
+from expman.pages import expenses as expenses_page  # noqa: E402
+from expman.pages import subscriptions as subs_page  # noqa: E402
+
+PASS, FAIL = [], []
+
+
+def settle(ms: int = 450) -> None:
+    """Let queued work run -- the search box is debounced, so a keystroke only
+    reaches the table after the timer fires."""
+    import time
+
+    deadline = time.perf_counter() + ms / 1000
+    while time.perf_counter() < deadline:
+        QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
+
+
+def check(label: str, condition: bool, detail: str = "") -> None:
+    (PASS if condition else FAIL).append(label)
+    mark = "ok  " if condition else "FAIL"
+    print(f"  [{mark}] {label}" + (f"  -- {detail}" if detail and not condition else ""))
+
+
+class StubDialog:
+    """Stands in for a modal dialog: reports accepted, returns fixed values."""
+
+    def __init__(self, values):
+        self._values = values
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def exec(self):
+        return 1
+
+    def values(self):
+        return dict(self._values)
+
+
+def stub_confirm(monkey_yes: bool = True, checked: bool = False):
+    def _exec(self):
+        box = self.checkBox()
+        if box is not None:
+            box.setChecked(checked)
+        return (
+            QMessageBox.StandardButton.Yes
+            if monkey_yes
+            else QMessageBox.StandardButton.Cancel
+        )
+
+    return _exec
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    db_path = os.path.join(tempfile.mkdtemp(prefix="expman_smoke_"), "smoke.db")
+    window = MainWindow(Database(db_path))
+    window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    window.show()
+
+    db = window.db
+    exp, subs, over = window.expenses, window.subscriptions, window.overview
+
+    # Silence the informational popups.
+    QMessageBox.information = staticmethod(lambda *a, **k: None)
+    QMessageBox.exec = stub_confirm()
+
+    print("\nExpenses")
+    dialogs_module.ExpenseDialog = StubDialog(
+        {
+            "spent_on": date.today(),
+            "amount_cents": 4250,
+            "category": "Groceries",
+            "description": "Weekly shop",
+            "notes": "",
+        }
+    )
+    expenses_page.ExpenseDialog = dialogs_module.ExpenseDialog
+    exp.add_expense()
+    check("add expense inserts a row", len(db.list_expenses()) == 1)
+    check("table shows the new row", exp.model.rowCount() == 1)
+    check(
+        "overview picks it up",
+        over.stat_total.value.text() == format_cents(4250, "$"),
+        over.stat_total.value.text(),
+    )
+
+    # A brand-new category typed into the combo must be created on the fly.
+    expenses_page.ExpenseDialog = StubDialog(
+        {
+            "spent_on": date.today(),
+            "amount_cents": 999,
+            "category": "Hobby supplies",
+            "description": "Yarn",
+            "notes": "for the scarf",
+        }
+    )
+    exp.add_expense()
+    check("free-typed category is created", "Hobby supplies" in db.categories())
+    check("category filter offers it", exp.category_filter.findData("Hobby supplies") > 0)
+
+    exp.table.selectRow(0)
+    selected = exp._selected_ids()
+    check("row selection resolves an id", len(selected) == 1, str(selected))
+
+    expenses_page.ExpenseDialog = StubDialog(
+        {
+            "spent_on": date.today(),
+            "amount_cents": 5000,
+            "category": "Groceries",
+            "description": "Edited",
+            "notes": "",
+        }
+    )
+    exp.edit_selected()
+    edited = db.conn.execute(
+        "SELECT * FROM expenses WHERE id = ?", (selected[0],)
+    ).fetchone()
+    check("edit writes through", edited["amount_cents"] == 5000, str(edited["amount_cents"]))
+
+    print("\nFilters")
+    exp.search.setText("Weekly")
+    settle()
+    check("search narrows the table", exp.model.rowCount() == 1, str(exp.model.rowCount()))
+    exp.search.setText("Edited")
+    settle()
+    check("search finds the edited row", exp.model.rowCount() == 1, str(exp.model.rowCount()))
+    exp.search.setText("zzzz-no-match")
+    settle()
+    check("no match empties the table", exp.model.rowCount() == 0)
+    exp.search.setText("")
+    settle()
+    check("clearing search restores rows", exp.model.rowCount() == 2)
+
+    for index in range(over.period_box.count()):
+        over.period_box.setCurrentIndex(index)
+        exp.period_filter.setCurrentIndex(index)
+    check("every period option renders", True)
+    exp.period_filter.setCurrentIndex(exp.period_filter.count() - 1)
+
+    print("\nSubscriptions")
+    start = date.today() - timedelta(days=95)
+    subs_page.SubscriptionDialog = StubDialog(
+        {
+            "name": "Netflix",
+            "amount_cents": 1599,
+            "category": "Subscriptions",
+            "cycle": "monthly",
+            "start_date": start,
+            "next_due": start,
+            "active": True,
+            "notes": "",
+        }
+    )
+    before = len(db.list_expenses())
+    subs.add_subscription()
+    posted = len(db.list_expenses()) - before
+    check("adding a back-dated subscription posts its charges", posted == 4, f"posted {posted}")
+    check("subscription table shows it", subs.table.rowCount() == 1)
+    check(
+        "next due moved into the future",
+        date.fromisoformat(db.list_subscriptions()[0]["next_due"]) > date.today(),
+    )
+    check("relaunch posts nothing further", db.post_due_subscriptions() == 0)
+
+    exp.refresh()
+    sub_rows = [r for r in db.list_expenses() if r["subscription_id"] is not None]
+    check("posted charges are attributed", len(sub_rows) == 4)
+    check("posted charges carry the name", sub_rows[0]["description"] == "Netflix")
+
+    subs.table.selectRow(0)
+    subs.toggle_selected()
+    check("pause deactivates", db.list_subscriptions()[0]["active"] == 0)
+    check("paused button offers resume", subs.pause_button.text() == "Resume")
+    subs.table.selectRow(0)
+    subs.toggle_selected()
+    check("resume reactivates", db.list_subscriptions()[0]["active"] == 1)
+
+    print("\nDeletes")
+    subs.table.selectRow(0)
+    QMessageBox.exec = stub_confirm(checked=False)
+    subs.delete_selected()
+    check("subscription removed", len(db.list_subscriptions()) == 0)
+    check(
+        "its logged charges survive by default",
+        len([r for r in db.list_expenses() if r["description"] == "Netflix"]) == 4,
+    )
+
+    exp.refresh()
+    exp.table.selectAll()
+    count = len(exp._selected_ids())
+    QMessageBox.exec = stub_confirm()
+    exp.delete_selected()
+    check(f"deleting all {count} expenses empties the log", len(db.list_expenses()) == 0)
+    over.refresh()
+    check("overview falls back to the empty state", over.chart_stack.currentIndex() == 1)
+
+    print("\nChrome")
+    start_theme = window.pal["name"]
+    window._toggle_theme()
+    check("theme toggles", window.pal["name"] != start_theme)
+    check("theme persists", db.get_setting("theme") == window.pal["name"])
+    window._toggle_theme()
+
+    window._set_currency("€")
+    check("currency persists", db.currency == "€")
+    check(
+        "currency reaches the UI",
+        "€" in over.stat_total.value.text(),
+        over.stat_total.value.text(),
+    )
+
+    for index in range(3):
+        window._navigate(index)
+    check("all pages navigate", window.stack.currentIndex() == 2)
+
+    print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
+    if FAIL:
+        for name in FAIL:
+            print("  FAILED:", name)
+    app.quit()
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
