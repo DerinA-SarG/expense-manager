@@ -14,9 +14,15 @@ SQLite file. No server, no accounts, no network calls anywhere in the app.
    the only place that converts. Floats are produced for display and never
    stored, summed or compared. A float creeping into the data layer is a bug
    even when the test still passes.
-2. **No network access, ever.** This app handles someone's financial records.
-   It has no telemetry, no update check, no cloud sync, and it must stay that
-   way. Adding an HTTP client is a design change, not an implementation detail.
+2. **No network access except the update check, and only when asked.** This
+   app handles someone's financial records: no telemetry, no cloud sync,
+   nothing that reaches anywhere on a timer, and it must stay that way. The one
+   exception is `expman/updates.py`, which shells out to `git fetch` when
+   someone presses "Check for updates" in the settings menu. Git is how the
+   project is distributed, so the check reuses it rather than putting an HTTP
+   client inside a finance app -- and a fetch asks for commits without offering
+   anything about the machine asking. Adding an HTTP client is still a design
+   change, not an implementation detail.
 3. **The database never lives in the project folder.** `default_data_dir()`
    resolves `%APPDATA%` / `~/.local/share` / `~/Library/Application Support`.
    `*.db` is gitignored so spending data can never be committed — keep it that
@@ -45,6 +51,7 @@ expman/
   ledger.py             shared query/aggregation helpers
   recurrence.py         subscription billing-cycle arithmetic
   csvio.py              issuer detection, CSV parse and export
+  updates.py            git comparison behind "Check for updates"
   import_dialog.py      the import wizard
   dialogs.py            add/edit dialogs, category manager, wipe
   charts.py             donut and progress-ring painting

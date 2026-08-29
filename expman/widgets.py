@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QHeaderView,
+    QLineEdit,
     QTableWidgetItem,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
@@ -16,6 +17,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+
+from .money import parse_percent
 
 
 class Card(QFrame):
@@ -88,6 +91,50 @@ class PageHeader(QWidget):
     def set_subtitle(self, text: str) -> None:
         self.subtitle.setText(text)
         self.subtitle.setVisible(bool(text))
+
+
+class PercentField(QWidget):
+    """A short box for a percentage, with the sign printed beside it.
+
+    A spin box kept the sign inside the box and hung steppers off its right
+    edge, so clicking into the text meant hitting the narrow gap between two
+    arrows and a stray click nudged the number. Nothing shares the box here:
+    the sign is a label outside it and the only thing in the field is what was
+    typed. Empty means nothing is set aside, which is why it starts blank
+    rather than at a zero someone has to select and overwrite.
+    """
+
+    changed = Signal()
+
+    def __init__(self, width: int = 74, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Transparent")
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText("0")
+        self.edit.setFixedWidth(width)
+        self.edit.textChanged.connect(lambda _: self.changed.emit())
+        row.addWidget(self.edit)
+
+        self.sign = QLabel("%")
+        self.sign.setObjectName("FieldLabel")
+        row.addWidget(self.sign)
+        row.addStretch(1)
+
+    def set_value(self, pct: float) -> None:
+        """Show a percentage, leaving the box empty for nothing at all."""
+        self.edit.setText(f"{float(pct):g}" if pct else "")
+
+    def value(self) -> float:
+        """What was typed, as a number. Raises ValueError on anything else."""
+        return parse_percent(self.edit.text())
+
+    def setFocus(self) -> None:  # noqa: N802 - matches the Qt method it stands in for
+        self.edit.setFocus()
 
 
 class Pill(QLabel):

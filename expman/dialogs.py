@@ -12,7 +12,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
     QDialog,
-    QDoubleSpinBox,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -29,7 +28,13 @@ from PySide6.QtWidgets import (
 from .money import format_cents, parse_amount
 from .recurrence import CYCLES, advance, monthly_cents
 from .theme import active_palette
-from .widgets import SortItem, align_headers, configure_columns, filling
+from .widgets import (
+    PercentField,
+    SortItem,
+    align_headers,
+    configure_columns,
+    filling,
+)
 
 DATE_FORMAT = "d MMM yyyy"
 
@@ -796,6 +801,7 @@ class GoalDialog(FormDialog):
         super().__init__("Edit goal" if goal else "New savings goal", parent, width=460)
         self.currency = currency
         self.amount_cents = 0
+        self.allocation_pct = 0.0
         # Used only to make the percentage concrete while you are choosing it.
         self.typical_income = typical_income
         self.other_pct = other_pct
@@ -814,25 +820,10 @@ class GoalDialog(FormDialog):
             "How much you are aiming to put aside in total.",
         )
 
-        # A share is set in whole per cent; the box stays a short number and a
-        # sign, with the sentence explaining it left to the hint below. Decimals
-        # come back only for a goal already cut at a fraction of a per cent --
-        # rounding that on an unrelated edit would quietly change the rate.
-        share = float(goal["allocation_pct"]) if goal else 0.0
-        self.allocation_field = QDoubleSpinBox()
-        self.allocation_field.setRange(0.0, 100.0)
-        self.allocation_field.setDecimals(0 if share == int(share) else 1)
-        self.allocation_field.setSingleStep(1.0)
-        self.allocation_field.setSuffix("%")
-        self.allocation_field.setValue(share)
-        self.allocation_field.setFixedWidth(96)
-        self.allocation_field.valueChanged.connect(self._refresh_allocation_hint)
-        row = self.add_row("Set aside automatically", self.allocation_field)
-        # A field narrower than the form is centred in it unless it is told
-        # otherwise, which would leave it floating away from every other label.
-        row.layout().setAlignment(
-            self.allocation_field, Qt.AlignmentFlag.AlignLeft
-        )
+        self.allocation_field = PercentField()
+        self.allocation_field.set_value(float(goal["allocation_pct"]) if goal else 0.0)
+        self.allocation_field.changed.connect(self._refresh_allocation_hint)
+        self.add_row("Set aside automatically", self.allocation_field)
 
         self.allocation_hint = QLabel("")
         self.allocation_hint.setObjectName("Muted")
@@ -848,7 +839,13 @@ class GoalDialog(FormDialog):
         self.name_field.setFocus()
 
     def _refresh_allocation_hint(self, *_) -> None:
-        pct = self.allocation_field.value()
+        # Runs on every keystroke, and half-typed input is not an error worth
+        # shouting about -- the hint just goes quiet until the number is usable.
+        try:
+            pct = self.allocation_field.value()
+        except ValueError:
+            self.allocation_hint.setText("")
+            return
         if pct <= 0:
             self.allocation_hint.setText(
                 "Nothing is set aside automatically -- you add to this goal by hand."
@@ -878,12 +875,16 @@ class GoalDialog(FormDialog):
         if not self.name_field.text().strip():
             raise ValueError("Give the goal a name.")
         self.amount_cents = parse_amount(self.target_field.text())
+        # Checked here so a typo in the share is reported the same way a typo in
+        # the amount is, rather than escaping through values() after the dialog
+        # has already been accepted.
+        self.allocation_pct = self.allocation_field.value()
 
     def values(self) -> dict:
         return {
             "name": self.name_field.text().strip(),
             "target_cents": self.amount_cents,
-            "allocation_pct": self.allocation_field.value(),
+            "allocation_pct": self.allocation_pct,
             "notes": self.notes_field.toPlainText().strip(),
         }
 

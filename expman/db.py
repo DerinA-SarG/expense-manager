@@ -959,12 +959,84 @@ class Database:
         )
         self.conn.commit()
 
-    def delete_goal(self, goal_id: int) -> None:
+    def redistribution_plan(self, goal_id: int) -> list[dict]:
+        """Where a goal's savings would land if they were shared out instead.
+
+        The freed money is treated the way an income entry is: the goals that
+        take a share of income take it in the same proportions. The proportions
+        are scaled to hand out all of it, though. Cutting it at the literal
+        percentages would leave whatever the goals do not claim between them
+        with nowhere to go, and money that is sitting in someone's savings today
+        would simply stop existing.
+
+        Nothing is written here -- the confirmation shows this before anything
+        is deleted, and applies the same list afterwards.
+        """
+        goal = self.get_goal(goal_id)
+        if goal is None or goal["saved_cents"] <= 0:
+            return []
+
+        others = [
+            g
+            for g in self.goals()
+            if g["id"] != int(goal_id) and float(g["allocation_pct"] or 0) > 0
+        ]
+        total_pct = sum(float(g["allocation_pct"]) for g in others)
+        if total_pct <= 0:
+            return []
+
+        amount = int(goal["saved_cents"])
+        shares = [
+            {
+                "id": g["id"],
+                "name": g["name"],
+                "exact": amount * float(g["allocation_pct"]) / total_pct,
+            }
+            for g in others
+        ]
+        for share in shares:
+            share["cents"] = int(share["exact"])
+
+        # Whole cents only, so the rounding loss is handed out a cent at a time,
+        # largest fraction first. The split has to add up to exactly what was
+        # freed: this is money being moved, not money being recalculated.
+        short = amount - sum(share["cents"] for share in shares)
+        by_fraction = sorted(shares, key=lambda s: s["exact"] - s["cents"], reverse=True)
+        for share in by_fraction[:short]:
+            share["cents"] += 1
+
+        return [
+            {"id": s["id"], "name": s["name"], "cents": s["cents"]}
+            for s in shares
+            if s["cents"] > 0
+        ]
+
+    def delete_goal(self, goal_id: int, redistribute: bool = False) -> list[dict]:
         """Contributions cascade away with the goal -- they have no meaning
         without it, unlike a subscription's posted charges, which were real
-        spending in their own right."""
-        self.conn.execute("DELETE FROM goals WHERE id = ?", (int(goal_id),))
-        self.conn.commit()
+        spending in their own right.
+
+        With redistribute set, what the goal holds is moved into the other goals
+        first, and the move and the delete are one transaction: the money must
+        never be in both places, nor in neither. It lands as ordinary
+        hand-entered contributions, with no income entry behind them -- no
+        income arrived, so re-cutting a payslip must not touch this money, and
+        the income page has nothing to show.
+        """
+        plan = self.redistribution_plan(goal_id) if redistribute else []
+        goal = self.get_goal(goal_id)
+        source = goal["name"] if goal else "a deleted goal"
+        with self.conn:
+            for share in plan:
+                self.add_contribution(
+                    share["id"],
+                    date.today(),
+                    share["cents"],
+                    note=f"Moved from {source}",
+                    commit=False,
+                )
+            self.conn.execute("DELETE FROM goals WHERE id = ?", (int(goal_id),))
+        return plan
 
     def goals(self) -> list[dict]:
         """Every goal with what has been put into it so far."""

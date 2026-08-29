@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -404,19 +405,45 @@ class GoalsPage(QWidget):
         confirm.setWindowTitle("Delete goal")
         confirm.setIcon(QMessageBox.Icon.Warning)
         confirm.setText(f"Delete “{goal['name']}”?")
-        confirm.setInformativeText(
-            f"Its {goal['contributions']} contribution"
-            f"{'s' if goal['contributions'] != 1 else ''} "
-            f"({format_cents(goal['saved_cents'], self.db.currency)}) go with it. "
+        count = goal["contributions"]
+        told = (
+            f"Its {count} contribution{'s' if count != 1 else ''} "
+            f"({format_cents(goal['saved_cents'], self.db.currency)}) "
+            f"{'go' if count != 1 else 'goes'} with it. "
             "This only removes the record of setting the money aside -- your "
             "expenses and income are untouched."
         )
+
+        # Offered only when there is money to move and somewhere to move it to.
+        plan = self.db.redistribution_plan(goal["id"])
+        move = None
+        if plan:
+            told += (
+                "\n\nOr keep the money: tick the box and it is shared out "
+                "between the goals that take a share of income, in the same "
+                "proportions they take it in."
+            )
+            move = QCheckBox(
+                f"Put its {format_cents(goal['saved_cents'], self.db.currency)} "
+                f"into your other goals"
+            )
+            move.setToolTip(
+                "\n".join(
+                    f"{share['name']}  "
+                    f"{format_cents(share['cents'], self.db.currency)}"
+                    for share in plan
+                )
+            )
+            confirm.setCheckBox(move)
+        confirm.setInformativeText(told)
         confirm.setStandardButtons(
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes
         )
         confirm.setDefaultButton(QMessageBox.StandardButton.Cancel)
         if confirm.exec() == QMessageBox.StandardButton.Yes:
-            self.db.delete_goal(goal["id"])
+            self.db.delete_goal(
+                goal["id"], redistribute=bool(move is not None and move.isChecked())
+            )
             self.selected_id = None
             self.refresh()
             self.on_changed()

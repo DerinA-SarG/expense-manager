@@ -55,6 +55,38 @@ def parse_amount(text: str) -> int:
     return int(value)
 
 
+def parse_percent(text: str) -> float:
+    """Parse a share out of user input. Blank means none at all.
+
+    Not money, but the same two decimal separators are in play, so it borrows
+    the rule above rather than growing a second one that could disagree with
+    it. A typed '%' is stripped along with everything else that is not a digit.
+    """
+    text = str(text).strip()
+    if not text:
+        return 0.0
+
+    # An empty box means no share, but a box with something unusable in it does
+    # not: reading "abc" as nothing would save a goal that quietly sets nothing
+    # aside, without ever saying so.
+    raw = _CLEAN.sub("", text).strip()
+    if not raw:
+        raise ValueError(f"'{text}' is not a valid percentage.")
+
+    try:
+        value = float(normalise_decimal(raw))
+    except ValueError as exc:
+        raise ValueError(f"'{text}' is not a valid percentage.") from exc
+
+    if value < 0:
+        raise ValueError("A share cannot be less than nothing.")
+    if value > 100:
+        raise ValueError("A share cannot be more than 100%.")
+    # Two places is as fine as a share of a payslip ever needs to be, and it
+    # keeps 12.5 from arriving as 12.499999999999998.
+    return round(value, 2)
+
+
 def format_cents(cents: int, symbol: str = "$", grouped: bool = True) -> str:
     """Render cents as a currency string, e.g. -1234 -> '-$12.34'."""
     sign = "-" if cents < 0 else ""

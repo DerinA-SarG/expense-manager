@@ -12,6 +12,7 @@ import sqlite3
 import sys
 import tempfile
 from datetime import date, timedelta
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -20,9 +21,11 @@ from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from expman import csvio  # noqa: E402
 from expman.app import MainWindow  # noqa: E402
+from expman import updates  # noqa: E402
 from expman.db import SCHEMA_VERSION, Database  # noqa: E402
 from expman.import_dialog import ImportDialog  # noqa: E402
-from expman.money import format_cents  # noqa: E402
+from expman.money import format_cents, parse_percent  # noqa: E402
+from expman.widgets import PercentField  # noqa: E402
 from expman.pages import goals as goals_page  # noqa: E402
 from expman.pages import income as income_page  # noqa: E402
 
@@ -585,6 +588,97 @@ def main() -> int:
     check("the file is left consistent",
           repaired.conn.execute("PRAGMA foreign_key_check").fetchall() == [])
     repaired.close()
+
+    # ------------------------------------------------------- typing a per cent
+    print("\nEntering a share")
+    check("a blank share means none", parse_percent("") == 0.0)
+    check("a plain number reads as a share", parse_percent("15") == 15.0)
+    check("a decimal share survives", parse_percent("12.5") == 12.5)
+    check("a comma decimal reads the same", parse_percent("12,5") == 12.5)
+    check("a typed per cent sign is ignored", parse_percent("15%") == 15.0)
+    for bad, label in (("-4", "below nothing"), ("101", "over everything"), ("abc", "not a number")):
+        try:
+            parse_percent(bad)
+            rejected = False
+        except ValueError:
+            rejected = True
+        check(f"a share {label} is rejected", rejected, bad)
+
+    field = PercentField()
+    field.set_value(0)
+    check("nothing set aside leaves the box empty", field.edit.text() == "", field.edit.text())
+    field.set_value(12.5)
+    check("a share is shown without padding", field.edit.text() == "12.5", field.edit.text())
+    check("and reads back as it was set", field.value() == 12.5)
+    field.edit.setText("7,5")
+    check("what is typed is what is read", field.value() == 7.5, str(field.value()))
+    check("the sign sits outside the box", field.sign.text() == "%")
+
+    # -------------------------------------------- moving a deleted goal's money
+    print("\nDeleting a goal, keeping its money")
+    share_db = Database(os.path.join(workdir, "share.db"))
+    doomed = share_db.add_goal("Old plan", 100000, allocation_pct=30)
+    big = share_db.add_goal("Big", 500000, allocation_pct=20)
+    small = share_db.add_goal("Small", 100000, allocation_pct=5)
+    manual = share_db.add_goal("By hand", 100000, allocation_pct=0)
+    share_db.add_contribution(doomed, date(2026, 8, 1), 10001, "saved up")
+
+    plan = share_db.redistribution_plan(doomed)
+    landing = {row["name"]: row["cents"] for row in plan}
+    check("the split reaches the goals that take a share", set(landing) == {"Big", "Small"},
+          str(landing))
+    check("a manual-only goal is not in it", "By hand" not in landing)
+    check("every cent is handed out", sum(landing.values()) == 10001, str(landing))
+    check("and in proportion to the shares taken", landing["Big"] == 8001, str(landing))
+    check("odd cents go to the largest share", landing["Small"] == 2000, str(landing))
+
+    before_total = sum(g["saved_cents"] for g in share_db.goals())
+    share_db.delete_goal(doomed, redistribute=True)
+    after = {g["name"]: g["saved_cents"] for g in share_db.goals()}
+    check("the goal is gone", "Old plan" not in after, str(after))
+    check("its money is not", sum(after.values()) == before_total, str(after))
+    check("it landed where the plan said", after["Big"] == 8001 and after["Small"] == 2000,
+          str(after))
+    moved = share_db.conn.execute(
+        "SELECT note, income_id FROM goal_contributions WHERE goal_id = ?", (big,)
+    ).fetchall()
+    check("the money says where it came from", moved[0]["note"] == "Moved from Old plan",
+          moved[0]["note"])
+    check("and is not tied to any income entry", moved[0]["income_id"] is None)
+    check("nothing was added to the income page", share_db.income_total() == 0)
+
+    # Deleting without the offer is still a plain delete.
+    share_db.add_contribution(manual, date(2026, 8, 2), 5000, "cash")
+    kept = sum(g["saved_cents"] for g in share_db.goals())
+    share_db.delete_goal(manual)
+    check("deleting without moving the money takes it with it",
+          sum(g["saved_cents"] for g in share_db.goals()) == kept - 5000)
+
+    lonely_db = Database(os.path.join(workdir, "lonely.db"))
+    only = lonely_db.add_goal("Only one", 100000, allocation_pct=10)
+    lonely_db.add_contribution(only, date(2026, 8, 1), 2500, "saved")
+    check("with nowhere to move it to there is nothing to offer",
+          lonely_db.redistribution_plan(only) == [])
+
+    # ---------------------------------------------------------------- updates
+    print("\nChecking for updates")
+    # No network here: a directory that is not a checkout answers before git
+    # ever reaches for one.
+    nowhere = os.path.join(workdir, "not-a-checkout")
+    os.makedirs(nowhere, exist_ok=True)
+    check("a folder outside a checkout has no repository",
+          updates.repo_root(Path(nowhere)) is None)
+    try:
+        updates.check(Path(nowhere))
+        refused = False
+    except updates.GitUnavailable:
+        refused = True
+    except Exception:
+        refused = False
+    check("and checking there says so rather than reaching out", refused)
+    check("the app itself knows where it came from",
+          updates.repo_root() is None or (updates.repo_root() / "expman").is_dir())
+    check("a source run is not a frozen build", updates.is_frozen() is False)
 
     # ------------------------------------------------------------ first paint
     print("\nLanding page")

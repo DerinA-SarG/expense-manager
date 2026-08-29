@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QPoint, QUrl, Qt, QTimer
+from PySide6.QtCore import QPoint, QThread, QUrl, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QActionGroup,
     QColor,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import updates
 from .db import Database
 from .dialogs import DeleteEverythingDialog
 from .pages.expenses import ExpensesPage
@@ -49,6 +50,27 @@ NAV = [
 ]
 
 
+class _UpdateCheck(QThread):
+    """Runs the git comparison off the GUI thread.
+
+    A fetch waits on a network, and a window that stops repainting for the
+    duration reads as a hang -- which is the one thing this app has already
+    been taught not to look like.
+    """
+
+    answered = Signal(object)
+
+    def run(self) -> None:
+        try:
+            self.answered.emit(updates.check())
+        except Exception as exc:  # shown to the user; never swallowed
+            self.answered.emit(exc)
+
+
+def _s(count: int) -> str:
+    return "" if count == 1 else "s"
+
+
 def make_icon(color: str, background: str) -> QIcon:
     """A small donut, so the taskbar entry is not a generic interpreter icon."""
     pixmap = QPixmap(64, 64)
@@ -69,6 +91,7 @@ class MainWindow(QWidget):
         super().__init__()
         self.db = db
         self.pal = palette(db.get_setting("theme", "dark"))
+        self._update_check: _UpdateCheck | None = None
 
         self.setWindowTitle(APP_NAME)
         self.resize(1180, 760)
@@ -202,6 +225,11 @@ class MainWindow(QWidget):
         reveal.setToolTip(str(self.db.path))
         reveal.triggered.connect(self._open_data_folder)
 
+        check = menu.addAction("Check for updates...")
+        check.setToolTip("Ask the project this copy came from whether it has moved on")
+        check.setEnabled(self._update_check is None)
+        check.triggered.connect(self.check_for_updates)
+
         menu.addSeparator()
 
         delete = menu.addAction("Delete data...")
@@ -227,6 +255,88 @@ class MainWindow(QWidget):
 
     def _open_data_folder(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.db.path.parent)))
+
+    # ----------------------------------------------------------------- updates
+
+    def check_for_updates(self) -> None:
+        """Compare this copy against the checkout it came from.
+
+        The only network call the app ever makes, and it only happens from
+        here. Nothing on disk changes until the update is accepted.
+        """
+        if self._update_check is not None:
+            return
+        self._update_check = _UpdateCheck(self)
+        self._update_check.answered.connect(self._update_answer)
+        self._update_check.finished.connect(self._forget_update_check)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._update_check.start()
+
+    def _forget_update_check(self) -> None:
+        """Dropped only once the thread has actually finished running."""
+        if self._update_check is not None:
+            self._update_check.deleteLater()
+            self._update_check = None
+
+    def _update_answer(self, result) -> None:
+        QApplication.restoreOverrideCursor()
+        if isinstance(result, Exception):
+            QMessageBox.information(self, "Check for updates", str(result))
+            return
+
+        if not result.available:
+            note = "This copy is up to date."
+            if result.ahead:
+                note += (
+                    f"\n\n{result.ahead} commit{_s(result.ahead)} here "
+                    "have not been pushed."
+                )
+            QMessageBox.information(self, "Check for updates", note)
+            return
+
+        ask = QMessageBox(self)
+        ask.setWindowTitle("Update available")
+        ask.setIcon(QMessageBox.Icon.Question)
+        ask.setText(
+            f"{result.behind} update{_s(result.behind)} waiting on {result.branch}."
+        )
+        told = "Bring this copy up to date?"
+        if result.dirty:
+            told += (
+                "\n\nThere are uncommitted changes here. The update will refuse "
+                "rather than write over them."
+            )
+        if updates.is_frozen():
+            told += (
+                "\n\nThis window is the packaged build, which carries its own "
+                "frozen copy of the code. Updating changes the source, not the "
+                ".exe -- it has to be rebuilt before the change reaches here."
+            )
+        ask.setInformativeText(told)
+        ask.setDetailedText("\n".join(f"- {s}" for s in result.subjects))
+        ask.setStandardButtons(
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes
+        )
+        ask.setDefaultButton(QMessageBox.StandardButton.Yes)
+        if ask.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            updates.pull()
+        except updates.GitUnavailable as exc:
+            QMessageBox.warning(self, "Update failed", str(exc))
+            return
+
+        if updates.is_frozen():
+            done = (
+                "The source is up to date, but this window is still running the "
+                "old frozen copy. Rebuild it with:\n\n"
+                "    python tools/build_exe.py\n\n"
+                "then start it again."
+            )
+        else:
+            done = "Updated. Restart Expense Manager to run the new version."
+        QMessageBox.information(self, "Update", done)
 
     # ----------------------------------------------------------------- events
 
