@@ -241,12 +241,15 @@ class GoalsPage(QWidget):
             else:
                 tile.update_from(goal, self.pal, currency)
             tile.set_selected(goal["id"] == self.selected_id)
-            if self.grid.indexOf(tile) == -1:
-                self.grid.addWidget(tile, index // COLUMNS, index % COLUMNS)
+            self._place(tile, index // COLUMNS, index % COLUMNS)
 
         # Keep a trailing stretch so a part-filled last row stays left-aligned
-        # instead of the tiles spreading across the width.
-        self.grid.setRowStretch(self.grid.rowCount(), 1)
+        # instead of the tiles spreading across the width. A grid never forgets
+        # a row, so the stretch left behind by a larger set of goals has to be
+        # cleared, or a row that now holds tiles would stretch them upright.
+        rows = (len(goals) + COLUMNS - 1) // COLUMNS
+        for row in range(max(self.grid.rowCount(), rows + 1)):
+            self.grid.setRowStretch(row, 0 if row < rows else 1)
         for column in range(COLUMNS):
             self.grid.setColumnStretch(column, 1)
 
@@ -287,6 +290,24 @@ class GoalsPage(QWidget):
             else "No goals yet."
         )
         self._sync_buttons()
+
+    def _place(self, tile: GoalTile, row: int, column: int) -> None:
+        """Put a tile in its cell, moving it when the ordering has shifted.
+
+        Goals come back sorted by name, so adding one pushes every goal after it
+        along a cell. A tile left where it was would end up sharing a cell with
+        its new neighbour -- a grid stacks two widgets in one cell rather than
+        complaining -- and one of the two goals would disappear from a page that
+        still counted it in the footer. Detaching a tile from the layout does not
+        destroy it, so a refresh raised from a tile's own click handler is still
+        safe.
+        """
+        at = self.grid.indexOf(tile)
+        if at != -1:
+            if self.grid.getItemPosition(at)[:2] == (row, column):
+                return
+            self.grid.removeWidget(tile)
+        self.grid.addWidget(tile, row, column)
 
     def _select(self, goal_id: int) -> None:
         self.selected_id = goal_id

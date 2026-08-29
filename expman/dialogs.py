@@ -814,14 +814,25 @@ class GoalDialog(FormDialog):
             "How much you are aiming to put aside in total.",
         )
 
+        # A share is set in whole per cent; the box stays a short number and a
+        # sign, with the sentence explaining it left to the hint below. Decimals
+        # come back only for a goal already cut at a fraction of a per cent --
+        # rounding that on an unrelated edit would quietly change the rate.
+        share = float(goal["allocation_pct"]) if goal else 0.0
         self.allocation_field = QDoubleSpinBox()
         self.allocation_field.setRange(0.0, 100.0)
-        self.allocation_field.setDecimals(1)
+        self.allocation_field.setDecimals(0 if share == int(share) else 1)
         self.allocation_field.setSingleStep(1.0)
-        self.allocation_field.setSuffix("% of every income entry")
-        self.allocation_field.setValue(float(goal["allocation_pct"]) if goal else 0.0)
+        self.allocation_field.setSuffix("%")
+        self.allocation_field.setValue(share)
+        self.allocation_field.setFixedWidth(96)
         self.allocation_field.valueChanged.connect(self._refresh_allocation_hint)
-        self.add_row("Set aside automatically", self.allocation_field)
+        row = self.add_row("Set aside automatically", self.allocation_field)
+        # A field narrower than the form is centred in it unless it is told
+        # otherwise, which would leave it floating away from every other label.
+        row.layout().setAlignment(
+            self.allocation_field, Qt.AlignmentFlag.AlignLeft
+        )
 
         self.allocation_hint = QLabel("")
         self.allocation_hint.setObjectName("Muted")
@@ -844,12 +855,14 @@ class GoalDialog(FormDialog):
             )
             return
 
-        parts = []
+        # The box carries a bare number now, so the hint has to say what the
+        # percentage is taken out of.
+        parts = [f"{pct:g}% of every income entry goes to this goal."]
         if self.typical_income:
             share = round(self.typical_income * pct / 100)
             parts.append(
                 f"On a typical {format_cents(self.typical_income, self.currency)} "
-                f"of income that is {format_cents(share, self.currency)}."
+                f"that is {format_cents(share, self.currency)}."
             )
         combined = self.other_pct + pct
         if combined > 100:
