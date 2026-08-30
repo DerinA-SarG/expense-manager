@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -31,7 +32,8 @@ from ..widgets import (
     filling,
 )
 
-COLUMNS = ["Name", "Category", "Cycle", "Next charge", "Per month", "Amount", "Status"]
+COLUMNS = ["Shown", "Name", "Category", "Cycle", "Next charge", "Per month",
+           "Amount", "Status"]
 
 
 def _relative(due: date, today: date | None = None) -> str:
@@ -91,8 +93,9 @@ class SubscriptionsPage(QWidget):
         self.table.doubleClicked.connect(self.edit_selected)
         self.table.itemSelectionChanged.connect(self._sync_buttons)
 
-        configure_columns(self.table, stretch=0)
-        align_headers(self.table, right={4, 5})
+        configure_columns(self.table, stretch=1)
+        align_headers(self.table, right={5, 6})
+        self.table.itemChanged.connect(self._item_changed)
 
         card.body.addWidget(self.table)
         outer.addWidget(card, 1)
@@ -103,6 +106,15 @@ class SubscriptionsPage(QWidget):
         self.summary.setObjectName("Subtle")
         footer.addWidget(self.summary)
         footer.addStretch(1)
+
+        self.show_all_button = QPushButton("Show all")
+        self.show_all_button.setToolTip("Count every subscription in the figures above")
+        self.show_all_button.clicked.connect(lambda: self._set_all_shown(True))
+        self.hide_all_button = QPushButton("Hide all")
+        self.hide_all_button.setToolTip("Leave every subscription out of the figures above")
+        self.hide_all_button.clicked.connect(lambda: self._set_all_shown(False))
+        footer.addWidget(self.show_all_button)
+        footer.addWidget(self.hide_all_button)
 
         self.pause_button = QPushButton("Pause")
         self.pause_button.clicked.connect(self.toggle_selected)
@@ -134,15 +146,33 @@ class SubscriptionsPage(QWidget):
         good = QColor(self.pal["good"])
         warning = QColor(self.pal["warning"])
 
-        with filling(self.table, autosize=range(1, len(COLUMNS))):
+        with filling(self.table, autosize=range(len(COLUMNS))):
             self.table.setRowCount(len(subs))
             for r, sub in enumerate(subs):
                 active = bool(sub["active"])
                 due = date.fromisoformat(sub["next_due"])
                 per_month = monthly_cents(sub["amount_cents"], sub["cycle"])
 
+                hidden = bool(sub["hidden"])
+                shown_item = QTableWidgetItem()
+                # The id lives on the first column because that is where the
+                # selection reads it from; the tick box is now that column.
+                shown_item.setData(Qt.ItemDataRole.UserRole, sub["id"])
+                shown_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                shown_item.setCheckState(
+                    Qt.CheckState.Unchecked if hidden else Qt.CheckState.Checked
+                )
+                shown_item.setToolTip(
+                    "Left out of the figures above. Tick to count it again."
+                    if hidden
+                    else "Counted in the figures above. Untick to leave it out."
+                )
+
                 name_item = SortItem(sub["name"], sub["name"].lower())
-                name_item.setData(Qt.ItemDataRole.UserRole, sub["id"])
                 if sub["notes"]:
                     name_item.setToolTip(sub["notes"])
 
@@ -173,6 +203,7 @@ class SubscriptionsPage(QWidget):
                 status_item = SortItem("Active" if active else "Paused", 0 if active else 1)
                 status_item.setForeground(good if active else muted)
 
+                self.table.setItem(r, 0, shown_item)
                 for c, item in enumerate(
                     [
                         name_item,
@@ -182,19 +213,31 @@ class SubscriptionsPage(QWidget):
                         month_item,
                         amount_item,
                         status_item,
-                    ]
+                    ],
+                    start=1,
                 ):
-                    if not active and c < 6:
+                    # A paused row keeps its green "Active"/"Paused" status in
+                    # its own colour; a row that is not being counted greys out
+                    # the whole way across, status included.
+                    if hidden or (not active and c < len(COLUMNS) - 1):
                         item.setForeground(muted)
+                    if hidden:
+                        font = item.font()
+                        font.setStrikeOut(True)
+                        item.setFont(font)
                     self.table.setItem(r, c, item)
 
 
-        active_subs = [s for s in subs if s["active"]]
+        # Paused and hidden are different things: a paused subscription has
+        # stopped charging, a hidden one is still charging but is not being
+        # counted here. Neither belongs in the commitment.
+        active_subs = [s for s in subs if s["active"] and not s["hidden"]]
+        left_out = sum(1 for s in subs if s["hidden"])
         monthly = sum(monthly_cents(s["amount_cents"], s["cycle"]) for s in active_subs)
-        self.stat_monthly.set(
-            format_cents(monthly, currency),
-            f"{len(active_subs)} active of {len(subs)}",
-        )
+        note = f"{len(active_subs)} active of {len(subs)}"
+        if left_out:
+            note += f" · {left_out} not counted"
+        self.stat_monthly.set(format_cents(monthly, currency), note)
         self.stat_yearly.set(format_cents(monthly * 12, currency), "at the current rate")
 
         if active_subs:
@@ -207,11 +250,10 @@ class SubscriptionsPage(QWidget):
         else:
             self.stat_next.set("--", "nothing scheduled")
 
-        self.summary.setText(
-            f"{len(subs)} subscription{'s' if len(subs) != 1 else ''}"
-            if subs
-            else "No subscriptions yet."
-        )
+        summary = f"{len(subs)} subscription{'s' if len(subs) != 1 else ''}"
+        if left_out:
+            summary += f" · {left_out} left out of the figures"
+        self.summary.setText(summary if subs else "No subscriptions yet.")
         self._sync_buttons()
 
     def _sync_buttons(self) -> None:
@@ -222,6 +264,27 @@ class SubscriptionsPage(QWidget):
         self.pause_button.setText(
             "Resume" if sub is not None and not sub["active"] else "Pause"
         )
+
+    # ------------------------------------------------------------ shown rows
+
+    def _item_changed(self, item) -> None:
+        """A tick box was clicked. Signals are blocked while the table refills,
+        so this only ever arrives from a real click."""
+        if item.column() != 0:
+            return
+        sub_id = item.data(Qt.ItemDataRole.UserRole)
+        if sub_id is None:
+            return
+        self.db.set_hidden(
+            "subscriptions",
+            [int(sub_id)],
+            item.checkState() != Qt.CheckState.Checked,
+        )
+        self.refresh()
+
+    def _set_all_shown(self, shown: bool) -> None:
+        self.db.set_hidden("subscriptions", None, not shown)
+        self.refresh()
 
     def _selected(self):
         model = self.table.selectionModel()

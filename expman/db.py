@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .recurrence import advance
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 DEFAULT_CATEGORIES = [
     "Groceries",
@@ -64,6 +64,10 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     next_due     TEXT    NOT NULL,
     active       INTEGER NOT NULL DEFAULT 1,
     notes        TEXT    NOT NULL DEFAULT '',
+    -- Set to leave this row out of the figures on its own page. A view
+    -- decision, not a deletion: the row stays where it is, and the
+    -- Overview goes on counting it.
+    hidden       INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT    NOT NULL
 );
 
@@ -75,6 +79,10 @@ CREATE TABLE IF NOT EXISTS expenses (
     description     TEXT    NOT NULL DEFAULT '',
     notes           TEXT    NOT NULL DEFAULT '',
     subscription_id INTEGER REFERENCES subscriptions(id) ON DELETE SET NULL,
+    -- Set to leave this row out of the figures on its own page. A view
+    -- decision, not a deletion: the row stays where it is, and the
+    -- Overview goes on counting it.
+    hidden          INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT    NOT NULL
 );
 
@@ -92,6 +100,10 @@ CREATE TABLE IF NOT EXISTS income (
     source       TEXT    NOT NULL,
     description  TEXT    NOT NULL DEFAULT '',
     notes        TEXT    NOT NULL DEFAULT '',
+    -- Set to leave this row out of the figures on its own page. A view
+    -- decision, not a deletion: the row stays where it is, and the
+    -- Overview goes on counting it.
+    hidden       INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT    NOT NULL
 );
 
@@ -174,6 +186,9 @@ class Database:
             ("goals", "allocation_pct", "REAL NOT NULL DEFAULT 0"),
             ("goal_contributions", "income_id", "INTEGER REFERENCES income(id)"),
             ("goal_contributions", "allocation_pct", "REAL NOT NULL DEFAULT 0"),
+            ("expenses", "hidden", "INTEGER NOT NULL DEFAULT 0"),
+            ("income", "hidden", "INTEGER NOT NULL DEFAULT 0"),
+            ("subscriptions", "hidden", "INTEGER NOT NULL DEFAULT 0"),
         )
         for table, column, spec in additions:
             existing = {
@@ -374,6 +389,32 @@ class Database:
         self.conn.commit()
         return cur.rowcount
 
+    # The table name goes straight into the SQL below, so the tuple is the
+    # guard: anything not in it is a caller bug rather than a query.
+    HIDEABLE = ("expenses", "income", "subscriptions")
+
+    def set_hidden(self, table: str, ids, hidden: bool) -> int:
+        """Show or hide rows. ids of None means every row in the table.
+
+        Hiding is a view decision and nothing else: the rows stay exactly where
+        they are and the page that owns them stops counting them.
+        """
+        if table not in self.HIDEABLE:
+            raise ValueError(f"{table} has nothing to hide")
+        flag = 1 if hidden else 0
+        if ids is None:
+            cur = self.conn.execute(f"UPDATE {table} SET hidden = ?", (flag,))
+        else:
+            ids = [int(i) for i in ids]
+            if not ids:
+                return 0
+            marks = ",".join("?" * len(ids))
+            cur = self.conn.execute(
+                f"UPDATE {table} SET hidden = ? WHERE id IN ({marks})", (flag, *ids)
+            )
+        self.conn.commit()
+        return cur.rowcount
+
     def list_expenses(
         self,
         start=None,
@@ -402,9 +443,13 @@ class Database:
         sql.append("ORDER BY e.spent_on DESC, e.id DESC")
         return list(self.conn.execute(" ".join(sql), args))
 
-    def category_totals(self, start=None, end=None) -> list[tuple[str, int]]:
+    def category_totals(
+        self, start=None, end=None, include_hidden: bool = True
+    ) -> list[tuple[str, int]]:
         sql = ["SELECT category, SUM(amount_cents) AS total FROM expenses WHERE 1 = 1"]
         args: list = []
+        if not include_hidden:
+            sql.append("AND hidden = 0")
         if start:
             sql.append("AND spent_on >= ?")
             args.append(_as_iso(start))
@@ -784,9 +829,11 @@ class Database:
         sql.append("ORDER BY received_on DESC, id DESC")
         return list(self.conn.execute(" ".join(sql), args))
 
-    def income_total(self, start=None, end=None) -> int:
+    def income_total(self, start=None, end=None, include_hidden: bool = True) -> int:
         sql = ["SELECT COALESCE(SUM(amount_cents), 0) AS total FROM income WHERE 1 = 1"]
         args: list = []
+        if not include_hidden:
+            sql.append("AND hidden = 0")
         if start:
             sql.append("AND received_on >= ?")
             args.append(_as_iso(start))
@@ -795,9 +842,13 @@ class Database:
             args.append(_as_iso(end))
         return int(self.conn.execute(" ".join(sql), args).fetchone()["total"])
 
-    def income_by_source(self, start=None, end=None) -> list[tuple[str, int]]:
+    def income_by_source(
+        self, start=None, end=None, include_hidden: bool = True
+    ) -> list[tuple[str, int]]:
         sql = ["SELECT source, SUM(amount_cents) AS total FROM income WHERE 1 = 1"]
         args: list = []
+        if not include_hidden:
+            sql.append("AND hidden = 0")
         if start:
             sql.append("AND received_on >= ?")
             args.append(_as_iso(start))

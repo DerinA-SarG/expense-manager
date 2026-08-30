@@ -516,6 +516,57 @@ def main() -> int:
     check("median income is available for the hint", alloc_db.typical_income() == 100000,
           str(alloc_db.typical_income()))
 
+    # ------------------------------------------------- leaving rows out
+    print("\nHiding rows from a page's figures")
+    hide_db = Database(os.path.join(workdir, "hide.db"))
+    keep = hide_db.add_expense(date(2026, 8, 1), 5000, "Groceries", "counted")
+    drop = hide_db.add_expense(date(2026, 8, 2), 3000, "Dining", "not counted")
+    paid = hide_db.add_income(date(2026, 8, 1), 200000, "Salary", "counted")
+    gift = hide_db.add_income(date(2026, 8, 3), 50000, "Gift", "not counted")
+
+    check("everything counts to begin with", hide_db.expense_span() is not None)
+    check("a row starts out shown",
+          hide_db.list_expenses()[0]["hidden"] == 0,
+          str(hide_db.list_expenses()[0]["hidden"]))
+
+    hide_db.set_hidden("expenses", [drop], True)
+    hide_db.set_hidden("income", [gift], True)
+    shown = {r["id"]: r["hidden"] for r in hide_db.list_expenses()}
+    check("hiding sets the flag", shown[drop] == 1 and shown[keep] == 0, str(shown))
+    check("the row is still there", len(hide_db.list_expenses()) == 2)
+
+    check("totals still count everything by default",
+          hide_db.income_total() == 250000, str(hide_db.income_total()))
+    check("and skip hidden rows when asked",
+          hide_db.income_total(include_hidden=False) == 200000,
+          str(hide_db.income_total(include_hidden=False)))
+    spent = dict(hide_db.category_totals(include_hidden=False))
+    check("a hidden expense leaves its category out", "Dining" not in spent, str(spent))
+    check("while the shown one stays", spent.get("Groceries") == 5000, str(spent))
+    sources = dict(hide_db.income_by_source(include_hidden=False))
+    check("a hidden source drops out too", "Gift" not in sources, str(sources))
+
+    hide_db.set_hidden("expenses", None, True)
+    check("everything can be hidden at once",
+          all(r["hidden"] for r in hide_db.list_expenses()))
+    check("and the figures go to nothing",
+          hide_db.category_totals(include_hidden=False) == [])
+    hide_db.set_hidden("expenses", None, False)
+    check("and shown again", not any(r["hidden"] for r in hide_db.list_expenses()))
+
+    try:
+        hide_db.set_hidden("goals", [1], True)
+        guarded = False
+    except ValueError:
+        guarded = True
+    check("only the three ledgers can hide rows", guarded)
+
+    sub = hide_db.add_subscription("Netflix", 1599, "Subscriptions", "monthly",
+                                   date(2026, 8, 1))
+    hide_db.set_hidden("subscriptions", [sub], True)
+    check("subscriptions carry the flag too",
+          hide_db.list_subscriptions()[0]["hidden"] == 1)
+
     # ---------------------------------------------- a file from an older build
     print("\nOpening a database from an older build")
     # Before goals could take a share of income, goal_contributions had no

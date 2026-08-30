@@ -21,13 +21,32 @@ from PySide6.QtWidgets import (
 )
 
 from ..dialogs import IncomeDialog
-from ..ledger import RIGHT, Column, LedgerModel, ledger_view, pretty_date
+from ..ledger import (
+    RIGHT,
+    Column,
+    LedgerModel,
+    is_hidden,
+    ledger_view,
+    pretty_date,
+)
 from ..money import format_cents
 from ..widgets import Card, EmptyState, PageHeader, StatCard, debounce
 from .overview import PERIODS, period_range
 
+def shown_column() -> Column:
+    """The tick box that keeps a row in this page's figures."""
+    return Column(
+        "Shown",
+        lambda r, c: "",
+        key=lambda r: 0 if is_hidden(r) else 1,
+        align=int(Qt.AlignmentFlag.AlignCenter),
+        checkable=True,
+    )
+
+
 def income_columns() -> list[Column]:
     return [
+        shown_column(),
         Column("Date", lambda r, c: pretty_date(r["received_on"]), key=lambda r: r["received_on"]),
         Column(
             "Description",
@@ -100,8 +119,10 @@ class IncomePage(QWidget):
         outer.addLayout(filters)
 
         card = Card(padding=0, spacing=0)
-        self.model = LedgerModel(income_columns(), self.pal)
-        self.table = ledger_view(self.model, stretch=1)
+        self.model = LedgerModel(
+            income_columns(), self.pal, on_toggle=self._set_shown
+        )
+        self.table = ledger_view(self.model, stretch=2, sort=1)
         self.table.doubleClicked.connect(self.edit_selected)
         self.table.selectionModel().selectionChanged.connect(self._sync_buttons)
 
@@ -128,6 +149,19 @@ class IncomePage(QWidget):
         self.summary.setObjectName("Subtle")
         footer.addWidget(self.summary)
         footer.addStretch(1)
+        self.show_all_button = QPushButton("Show all")
+        self.show_all_button.setToolTip(
+            "Count every row the filters are showing"
+        )
+        self.show_all_button.clicked.connect(lambda: self._set_all_shown(True))
+        self.hide_all_button = QPushButton("Hide all")
+        self.hide_all_button.setToolTip(
+            "Leave every row the filters are showing out of the figures"
+        )
+        self.hide_all_button.clicked.connect(lambda: self._set_all_shown(False))
+        footer.addWidget(self.show_all_button)
+        footer.addWidget(self.hide_all_button)
+
         self.edit_button = QPushButton("Edit")
         self.edit_button.clicked.connect(self.edit_selected)
         self.delete_button = QPushButton("Delete")
@@ -181,10 +215,14 @@ class IncomePage(QWidget):
 
         self.stack.setCurrentIndex(0 if rows else 1)
 
-        # Headline figures always describe the chosen period, not the filters,
-        # so the net here matches the net on the Overview.
-        income = self.db.income_total(start, end)
-        spent = sum(a for _, a in self.db.category_totals(start, end))
+        # Headline figures describe the chosen period rather than the filters,
+        # and skip anything ticked out of the figures on either ledger. That is
+        # the one place they part company with the Overview, which counts
+        # everything regardless of what has been hidden here.
+        income = self.db.income_total(start, end, include_hidden=False)
+        spent = sum(
+            a for _, a in self.db.category_totals(start, end, include_hidden=False)
+        )
         net = income - spent
 
         self.stat_total.set(format_cents(income, currency), self._period_label())
@@ -196,7 +234,7 @@ class IncomePage(QWidget):
             f"color: {self.pal['good'] if net >= 0 else self.pal['critical']};"
         )
 
-        by_source = self.db.income_by_source(start, end)
+        by_source = self.db.income_by_source(start, end, include_hidden=False)
         if by_source:
             name, amount = by_source[0]
             share = (amount / income * 100) if income else 0
@@ -204,13 +242,14 @@ class IncomePage(QWidget):
         else:
             self.stat_top.set("--", "nothing logged yet")
 
-        total = sum(row["amount_cents"] for row in rows)
-        noun = "entry" if len(rows) == 1 else "entries"
-        self.summary.setText(
-            f"{len(rows):,} {noun} · {format_cents(total, currency)}"
-            if rows
-            else "Nothing matches these filters."
-        )
+        counted = [row for row in rows if not is_hidden(row)]
+        total = sum(row["amount_cents"] for row in counted)
+        noun = "entry" if len(counted) == 1 else "entries"
+        text = f"{len(counted):,} {noun} · {format_cents(total, currency)}"
+        left_out = len(rows) - len(counted)
+        if left_out:
+            text += f" · {left_out:,} not counted"
+        self.summary.setText(text if rows else "Nothing matches these filters.")
         self.header.set_subtitle(
             "Everything coming in. Deposits found in an imported CSV land here too."
         )
@@ -223,6 +262,26 @@ class IncomePage(QWidget):
         count = len(self._selected_ids())
         self.edit_button.setEnabled(count == 1)
         self.delete_button.setEnabled(count >= 1)
+
+    # ------------------------------------------------------------ shown rows
+
+    def _set_shown(self, row, shown: bool) -> None:
+        """One tick box. Only this page's figures change."""
+        self.db.set_hidden("income", [row["id"]], not shown)
+        self.refresh()
+
+    def _set_all_shown(self, shown: bool) -> None:
+        """Both buttons act on what the filters are showing, not the whole log.
+
+        Hiding everything in a search is how a question like "what if none of
+        this counted" gets asked; hiding rows nobody can see would only be
+        confusing later.
+        """
+        rows = self._current_rows()
+        if not rows:
+            return
+        self.db.set_hidden("income", [r["id"] for r in rows], not shown)
+        self.refresh()
 
     def _selected_ids(self) -> list[int]:
         selection = self.table.selectionModel()

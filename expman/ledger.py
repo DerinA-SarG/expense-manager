@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont
 
 from datetime import date as _date
 
@@ -21,6 +21,18 @@ def pretty_date(iso: str) -> str:
     """ISO date to "3 Aug 2026". Only ever called for rows on screen."""
     value = _date.fromisoformat(iso)
     return f"{value.day} {value.strftime('%b %Y')}"
+
+
+def is_hidden(row) -> bool:
+    """Whether a row has been ticked out of its page's figures.
+
+    Tolerant of rows that have no such column: the category and source
+    summaries are handed rows built by GROUP BY, not by SELECT *.
+    """
+    try:
+        return bool(row["hidden"])
+    except (IndexError, KeyError):
+        return False
 
 
 RIGHT = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -39,6 +51,8 @@ class Column:
     ink: Callable[[Any, dict], str | None] | None = None
     tooltip: Callable[[Any], str] | None = None
     stretch: bool = False
+    # A tick box the reader can click, rather than a value read off the row.
+    checkable: bool = False
 
     def sort_value(self, row) -> Any:
         return self.key(row) if self.key else self.display(row, "")
@@ -51,11 +65,21 @@ class LedgerModel(QAbstractTableModel):
     before QAbstractTableModel's own constructor had built the C++ side.
     """
 
-    def __init__(self, columns: list[Column], palette: dict, currency: str = "$", parent=None):
+    def __init__(
+        self,
+        columns: list[Column],
+        palette: dict,
+        currency: str = "$",
+        on_toggle=None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.columns = columns
         self.palette = palette
         self.currency = currency
+        # Called with (row, shown) when a tick box is clicked. The page owns
+        # what that means; the model only reports the click.
+        self.on_toggle = on_toggle
         self.rows: list = []
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.DescendingOrder
@@ -95,16 +119,54 @@ class LedgerModel(QAbstractTableModel):
         row = self.rows[index.row()]
         column = self.columns[index.column()]
 
+        if role == Qt.ItemDataRole.CheckStateRole and column.checkable:
+            return (
+                Qt.CheckState.Unchecked if is_hidden(row) else Qt.CheckState.Checked
+            )
         if role == Qt.ItemDataRole.DisplayRole:
-            return column.display(row, self.currency)
+            return "" if column.checkable else column.display(row, self.currency)
         if role == Qt.ItemDataRole.TextAlignmentRole:
             return column.align
-        if role == Qt.ItemDataRole.ForegroundRole and column.ink:
-            name = column.ink(row, self.palette)
-            return QColor(name) if name else None
-        if role == Qt.ItemDataRole.ToolTipRole and column.tooltip:
-            return column.tooltip(row) or None
+        if role == Qt.ItemDataRole.ForegroundRole:
+            # A hidden row is greyed the whole way across, which outranks a
+            # column's own ink: the point is that the row is not being counted.
+            if is_hidden(row):
+                return QColor(self.palette["muted"])
+            if column.ink:
+                name = column.ink(row, self.palette)
+                return QColor(name) if name else None
+            return None
+        if role == Qt.ItemDataRole.FontRole and is_hidden(row):
+            font = QFont()
+            font.setStrikeOut(True)
+            return font
+        if role == Qt.ItemDataRole.ToolTipRole:
+            if column.checkable:
+                return (
+                    "Counted in the figures below. Untick to leave it out."
+                    if not is_hidden(row)
+                    else "Left out of the figures below. Tick to count it again."
+                )
+            if column.tooltip:
+                return column.tooltip(row) or None
         return None
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole) -> bool:
+        if role != Qt.ItemDataRole.CheckStateRole or not index.isValid():
+            return False
+        column = self.columns[index.column()]
+        if not column.checkable or self.on_toggle is None:
+            return False
+        # Qt hands the state over as an int through the model interface.
+        shown = Qt.CheckState(value) == Qt.CheckState.Checked
+        self.on_toggle(self.rows[index.row()], shown)
+        return True
+
+    def flags(self, index):
+        base = super().flags(index)
+        if index.isValid() and self.columns[index.column()].checkable:
+            return base | Qt.ItemFlag.ItemIsUserCheckable
+        return base
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if orientation != Qt.Orientation.Horizontal:
@@ -140,7 +202,7 @@ RESIZE_SAMPLE = 48
 ROW_HEIGHT = 38
 
 
-def ledger_view(model: LedgerModel, stretch: int, parent=None):
+def ledger_view(model: LedgerModel, stretch: int, sort: int = 0, parent=None):
     """A QTableView wired to a LedgerModel, tuned for long logs."""
     from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableView
 
@@ -153,7 +215,7 @@ def ledger_view(model: LedgerModel, stretch: int, parent=None):
     view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
     view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     view.setSortingEnabled(True)
-    view.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+    view.sortByColumn(sort, Qt.SortOrder.DescendingOrder)
 
     # Fixed row heights let the view skip measuring rows it never paints.
     rows = view.verticalHeader()

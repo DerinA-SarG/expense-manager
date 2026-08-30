@@ -23,7 +23,14 @@ from PySide6.QtWidgets import (
 from .. import csvio
 from ..dialogs import CategoryManagerDialog, ExpenseDialog
 from ..import_dialog import ImportDialog
-from ..ledger import RIGHT, Column, LedgerModel, ledger_view, pretty_date
+from ..ledger import (
+    RIGHT,
+    Column,
+    LedgerModel,
+    is_hidden,
+    ledger_view,
+    pretty_date,
+)
 from ..money import format_cents
 from ..widgets import Card, PageHeader, debounce
 from .overview import PERIODS, period_range
@@ -34,8 +41,20 @@ def _source(row, _currency="") -> str:
     return row["subscription_name"] or "Subscription"
 
 
+def shown_column() -> Column:
+    """The tick box that keeps a row in this page's figures."""
+    return Column(
+        "Shown",
+        lambda r, c: "",
+        key=lambda r: 0 if is_hidden(r) else 1,
+        align=int(Qt.AlignmentFlag.AlignCenter),
+        checkable=True,
+    )
+
+
 def expense_columns() -> list[Column]:
     return [
+        shown_column(),
         Column("Date", lambda r, c: pretty_date(r["spent_on"]), key=lambda r: r["spent_on"]),
         Column(
             "Description",
@@ -128,8 +147,10 @@ class ExpensesPage(QWidget):
 
         # ------------------------------------------------------------- table
         card = Card(padding=0, spacing=0)
-        self.model = LedgerModel(expense_columns(), self.pal)
-        self.table = ledger_view(self.model, stretch=1)
+        self.model = LedgerModel(
+            expense_columns(), self.pal, on_toggle=self._set_shown
+        )
+        self.table = ledger_view(self.model, stretch=2, sort=1)
         self.table.doubleClicked.connect(self.edit_selected)
         self.table.selectionModel().selectionChanged.connect(self._sync_buttons)
 
@@ -143,6 +164,19 @@ class ExpensesPage(QWidget):
         self.summary.setObjectName("Subtle")
         footer.addWidget(self.summary)
         footer.addStretch(1)
+
+        self.show_all_button = QPushButton("Show all")
+        self.show_all_button.setToolTip(
+            "Count every row the filters are showing"
+        )
+        self.show_all_button.clicked.connect(lambda: self._set_all_shown(True))
+        self.hide_all_button = QPushButton("Hide all")
+        self.hide_all_button.setToolTip(
+            "Leave every row the filters are showing out of the figures"
+        )
+        self.hide_all_button.clicked.connect(lambda: self._set_all_shown(False))
+        footer.addWidget(self.show_all_button)
+        footer.addWidget(self.hide_all_button)
 
         self.edit_button = QPushButton("Edit")
         self.edit_button.clicked.connect(self.edit_selected)
@@ -196,13 +230,14 @@ class ExpensesPage(QWidget):
         self.model.set_palette(self.pal)
         self.model.set_rows(rows, currency)
 
-        total = sum(row["amount_cents"] for row in rows)
-        noun = "expense" if len(rows) == 1 else "expenses"
-        self.summary.setText(
-            f"{len(rows):,} {noun} · {format_cents(total, currency)}"
-            if rows
-            else "Nothing matches these filters."
-        )
+        counted = [row for row in rows if not is_hidden(row)]
+        total = sum(row["amount_cents"] for row in counted)
+        noun = "expense" if len(counted) == 1 else "expenses"
+        text = f"{len(counted):,} {noun} · {format_cents(total, currency)}"
+        left_out = len(rows) - len(counted)
+        if left_out:
+            text += f" · {left_out:,} not counted"
+        self.summary.setText(text if rows else "Nothing matches these filters.")
         self.header.set_subtitle(
             "Every charge, manual or posted by a subscription. Double-click a row to edit it."
         )
@@ -212,6 +247,26 @@ class ExpensesPage(QWidget):
         count = len(self._selected_ids())
         self.edit_button.setEnabled(count == 1)
         self.delete_button.setEnabled(count >= 1)
+
+    # ------------------------------------------------------------ shown rows
+
+    def _set_shown(self, row, shown: bool) -> None:
+        """One tick box. Only this page's figures change."""
+        self.db.set_hidden("expenses", [row["id"]], not shown)
+        self.refresh()
+
+    def _set_all_shown(self, shown: bool) -> None:
+        """Both buttons act on what the filters are showing, not the whole log.
+
+        Hiding everything in a search is how a question like "what if none of
+        this counted" gets asked; hiding rows nobody can see would only be
+        confusing later.
+        """
+        rows = self._current_rows()
+        if not rows:
+            return
+        self.db.set_hidden("expenses", [r["id"] for r in rows], not shown)
+        self.refresh()
 
     def _selected_ids(self) -> list[int]:
         model = self.table.selectionModel()

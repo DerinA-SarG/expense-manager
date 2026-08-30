@@ -272,6 +272,49 @@ def main() -> int:
           str(db.get_goal(keeper)["saved_cents"]))
     check("and no income entry appears for it", db.income_total() == 0)
 
+    print("\nShown and hidden")
+    # The delete checks above emptied the log; put something back to count.
+    db.add_expense(date.today(), 4500, "Groceries", "weekly shop")
+    db.add_expense(date.today(), 2500, "Dining", "lunch")
+    exp.refresh()
+    rows_before = exp.model.rowCount()
+    check("the ledger leads with a tick box", exp.model.columns[0].checkable)
+    counted = exp.summary.text()
+    exp.model.setData(exp.model.index(0, 0), Qt.CheckState.Unchecked,
+                      Qt.ItemDataRole.CheckStateRole)
+    check("unticking a row leaves it in the table", exp.model.rowCount() == rows_before)
+    check("but takes it out of the total", exp.summary.text() != counted,
+          exp.summary.text())
+    check("and says how many are not counted", "not counted" in exp.summary.text(),
+          exp.summary.text())
+    check("the row is greyed out",
+          exp.model.data(exp.model.index(0, 1), Qt.ItemDataRole.FontRole).strikeOut())
+
+    exp._set_all_shown(False)
+    check("hide all empties the total",
+          exp.summary.text().startswith("0 expenses"), exp.summary.text())
+    exp._set_all_shown(True)
+    check("show all brings it back", exp.summary.text() == counted, exp.summary.text())
+
+    # Same again for subscriptions, which the delete checks also cleared.
+    db.add_subscription("Netflix", 1599, "Subscriptions", "monthly", date.today())
+    window._navigate(3)
+    subs.refresh()
+    first = subs.table.item(0, 0)
+    check("subscriptions lead with a tick box too", first is not None
+          and first.checkState() == Qt.CheckState.Checked)
+    monthly_before = subs.stat_monthly.value.text()
+    subs._set_all_shown(False)
+    check("hiding every subscription empties the commitment",
+          subs.stat_monthly.value.text() != monthly_before,
+          subs.stat_monthly.value.text())
+    check("and the footer says so", "left out" in subs.summary.text(),
+          subs.summary.text())
+    subs._set_all_shown(True)
+    check("showing them again restores it",
+          subs.stat_monthly.value.text() == monthly_before,
+          subs.stat_monthly.value.text())
+
     # ---------------------------------------------------------------- updates
     print("\nUpdates")
     # No network is touched: the handler is handed the answers a check would
