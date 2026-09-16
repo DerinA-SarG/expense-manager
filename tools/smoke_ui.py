@@ -272,6 +272,66 @@ def main() -> int:
           str(db.get_goal(keeper)["saved_cents"]))
     check("and no income entry appears for it", db.income_total() == 0)
 
+    print("\nUpdating goals by hand")
+    # Earlier sections left goals and income of their own behind. Clearing both
+    # is what makes the figures below the ones this block put there.
+    for leftover in db.goals():
+        db.delete_goal(leftover["id"])
+    db.skip_pending()
+    goals.refresh()
+    check("no banner when there is nothing waiting", goals.pending_banner.isHidden())
+
+    saver = db.add_goal("Rainy day", 500000, allocation_pct=20)
+    db.add_income(date.today(), 100000, "Salary", "pay day")
+    goals.refresh()
+    check("logging income raises the banner", not goals.pending_banner.isHidden())
+    check(
+        "which says what is waiting",
+        format_cents(20000, db.currency) in goals.pending_banner.title.text(),
+        goals.pending_banner.title.text(),
+    )
+    check(
+        "and the tile says what it is owed",
+        "waiting" in goals.tiles[saver].allocation.text(),
+        goals.tiles[saver].allocation.text(),
+    )
+    check("but the goal itself has not moved", db.get_goal(saver)["saved_cents"] == 0)
+
+    goals.apply_pending()
+    check("pressing update sets it aside", db.get_goal(saver)["saved_cents"] == 20000,
+          str(db.get_goal(saver)["saved_cents"]))
+    check("and the banner goes away", goals.pending_banner.isHidden())
+    check("the sidebar step is ticked", "goals" in window.journey.done,
+          str(window.journey.done))
+
+    # Money above a target is offered to the goals with room.
+    # Room enough for all of it: what happens when there is not is covered in
+    # smoke_features, where the money stays put rather than vanishing.
+    spare = db.add_goal("Spare", 1000000, allocation_pct=10)
+    db.add_contribution(saver, date.today(), 600000, "windfall")
+    goals.refresh()
+    check("a goal over its target is flagged", not goals.excess_banner.isHidden())
+    check(
+        "and the tile says by how much",
+        "over target" in goals.tiles[saver].status.text(),
+        goals.tiles[saver].status.text(),
+    )
+    total_before = sum(g["saved_cents"] for g in db.goals())
+    goals.settle_excess()
+    check("sharing it out stops the goal at its target",
+          db.get_goal(saver)["saved_cents"] == 500000,
+          str(db.get_goal(saver)["saved_cents"]))
+    check("without losing any of it",
+          sum(g["saved_cents"] for g in db.goals()) == total_before,
+          str([(g["name"], g["saved_cents"]) for g in db.goals()]))
+    check("and the flag clears", goals.excess_banner.isHidden())
+
+    for goal in db.goals():
+        db.delete_goal(goal["id"])
+    db.delete_income([r["id"] for r in db.list_income()])
+    goals.refresh()
+
+
     print("\nShown and hidden")
     # The delete checks above emptied the log; put something back to count.
     db.add_expense(date.today(), 4500, "Groceries", "weekly shop")

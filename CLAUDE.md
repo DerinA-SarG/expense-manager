@@ -30,14 +30,24 @@ SQLite file. No server, no accounts, no network calls anywhere in the app.
 4. **Historical figures are not restated.** Goal contributions remember the
    percentage they were cut at. Changing a goal's percentage applies from that
    point forward and leaves money already set aside untouched. Editing an
-   income entry re-cuts its share at the rate it was *originally* set aside at.
-   This is deliberate: a correction to one payslip must not silently rewrite
-   what was banked in March.
-5. **Money in and money out are different things.** Credits are never folded
+   income entry that has already been applied re-cuts its share at the rate it
+   was *originally* set aside at. This is deliberate: a correction to one
+   payslip must not silently rewrite what was banked in March.
+5. **Goals move because a person moved them.** Logging income sets nothing
+   aside. It leaves `income.allocated_at` NULL, the goals page works the split
+   out and shows it, and `apply_pending` writes it when the button is pressed.
+   Adding an automatic write back into `add_income` would undo the whole point.
+6. **A goal never holds more than its target.** What a full goal cannot take
+   goes to the goals that still have room, in proportion to the share of income
+   each takes. `expman/allocation.py` is the only place that decides this, it
+   returns plans and never writes, and a split always adds up to exactly what
+   went into it -- whatever cannot be placed is *returned* as `unplaced` and
+   said out loud in the UI. Money is moved here, never recalculated away.
+7. **Money in and money out are different things.** Credits are never folded
    into the expense log as negative expenses — that would corrupt the category
    chart. CSV rows are classified by direction and routed to expenses or
    income accordingly.
-6. **`SCHEMA_VERSION` in `expman/db.py` must be bumped** when the schema
+8. **`SCHEMA_VERSION` in `expman/db.py` must be bumped** when the schema
    changes, and existing databases must keep opening.
 
 ## Repo map
@@ -48,6 +58,8 @@ expman/
   app.py                MainWindow, navigation, theme plumbing
   db.py                 schema + every query (largest module, start here)
   money.py              cents parsing/formatting, locale-aware decimals
+  allocation.py         capped splits and overflow; plans only, no writes
+  journey.py            the session step tracker painted into the sidebar
   ledger.py             shared query/aggregation helpers
   recurrence.py         subscription billing-cycle arithmetic
   csvio.py              issuer detection, CSV parse and export
@@ -62,7 +74,10 @@ tools/                  test and build scripts (see below)
 ```
 
 Tables: `meta`, `categories`, `subscriptions`, `expenses`, `income_sources`,
-`income`, `goals`, `goal_contributions`.
+`income`, `goals`, `goal_contributions`. `income.allocated_at` is NULL while an
+entry's share is still waiting to be set aside; the migration that adds the
+column stamps every existing row, because those were split when they were logged
+and must not be offered a second time.
 
 ## Commands
 
@@ -84,14 +99,14 @@ drive the real widgets with dialogs stubbed, so handlers are exercised rather
 than just the data layer underneath.
 
 ```bash
-QT_QPA_PLATFORM=offscreen python tools/smoke_features.py   # 113 checks
-QT_QPA_PLATFORM=offscreen python tools/smoke_ui.py         # 30 checks
+QT_QPA_PLATFORM=offscreen python tools/smoke_features.py   # 228 checks
+QT_QPA_PLATFORM=offscreen python tools/smoke_ui.py         # 64 checks
 ```
 
-`smoke_features.py` covers goals, income, the category manager and CSV
-import/export. `smoke_ui.py` covers add/edit/delete, subscription posting,
-filters, theme and currency changes. Both print `N passed, M failed` and exit
-non-zero on failure. Add checks there when you add behaviour — the existing
+`smoke_features.py` covers goals, income, overflow, resets, the sidebar steps,
+the category manager and CSV import/export. `smoke_ui.py` covers add/edit/delete,
+subscription posting, the goals banners, filters, theme and currency changes.
+Both print `N passed, M failed` and exit non-zero on failure. Add checks there when you add behaviour — the existing
 style is one `check(label, condition, detail)` per assertion, grouped under a
 printed heading.
 
@@ -113,8 +128,8 @@ runs it under a watchdog and writes `freeze-report.txt`.
 - Qt widgets are built in a `_build()` method; signals connected in one place.
 - Pages rebuild lazily — a hidden page has not rebuilt yet and picks changes up
   when opened. Do not force eager rebuilds; the smoke suite asserts this.
-- Comments explain *why*. `money.py` and the goals logic carry the density,
-  because their rules are non-obvious and easy to "fix" wrongly.
+- Comments explain *why*. `money.py`, `allocation.py` and the goals logic carry
+  the density, because their rules are non-obvious and easy to "fix" wrongly.
 - British spelling in UI text and comments.
 
 ## Things that will bite you
@@ -146,5 +161,5 @@ pages one at a time, each with smoke checks written alongside it rather than
 afterwards. CSV import last — it is the largest surface area and the easiest to
 get subtly wrong, and it depends on everything else already being trustworthy.
 
-Write the check before the feature where you can. The 113 assertions in
+Write the check before the feature where you can. The 228 assertions in
 `smoke_features.py` are what make this codebase safe to change.

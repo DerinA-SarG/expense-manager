@@ -87,11 +87,14 @@ def expense_columns() -> list[Column]:
 
 
 class ExpensesPage(QWidget):
-    def __init__(self, db, palette: dict, on_changed=None, parent=None):
+    def __init__(self, db, palette: dict, on_changed=None, on_step=None, parent=None):
         super().__init__(parent)
         self.db = db
         self.pal = palette
         self.on_changed = on_changed or (lambda: None)
+        # Ticks a step off the panel in the sidebar. Called only where something
+        # was really logged, so closing the dialog again counts for nothing.
+        self.on_step = on_step or (lambda key: None)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(28, 24, 28, 24)
@@ -286,6 +289,7 @@ class ExpensesPage(QWidget):
             self.refresh_categories()
             self.refresh()
             self.on_changed()
+            self.on_step("expenses")
 
     def edit_selected(self) -> None:
         ids = self._selected_ids()
@@ -330,6 +334,11 @@ class ExpensesPage(QWidget):
             self.refresh_categories()
             self.refresh()
             self.on_changed()
+            # An import is both steps at once, or either one on its own.
+            if dialog.imported_expenses:
+                self.on_step("expenses")
+            if dialog.imported_income:
+                self.on_step("income")
 
             parts = []
             if dialog.imported_expenses:

@@ -53,6 +53,12 @@ python main.py --demo
 
 ## The five pages
 
+The sidebar carries a small tracker under the navigation — **Enter Income**,
+**Enter Expenses**, **Update Goals** — which ticks off as you do each one and
+starts empty again at every launch. It is asking what you have done since you
+opened the window, so it deliberately remembers nothing between sittings. Click
+a step to jump to the page it belongs to.
+
 **Overview** — a donut chart of spending by category for a period you pick
 (this month, last month, last 3 months, year to date, all time). Beside it is a
 ranked list giving each category's exact amount, share, and a comparison bar;
@@ -85,22 +91,38 @@ period, and which source is carrying the most. Deposits found in an imported CSV
 land here automatically.
 
 **Goals** — savings targets, each drawn as its own progress ring. A goal has a
-name, a target, and **a share of your income that is set aside for it
-automatically**: put 10% on an emergency fund and every pay packet you log
-quietly moves 10% of it into that goal. You can still add money by hand, and a
-goal set to 0% is entirely manual.
+name, a target, and **a share of your income**: put 10% on an emergency fund and
+every pay packet you log works out what that goal is owed. You can still add
+money by hand, and a goal set to 0% is entirely manual.
 
-- A share is set aside the moment an income entry is logged, and each
-  contribution remembers the percentage it was cut at. Changing a goal's
+Nothing moves until you say so. Logging income leaves a share *waiting*; a
+banner at the top of the page says exactly how much that comes to and which
+goals it would go into, and **Update goals** is what actually sets it aside.
+**Skip** takes that income out of the queue without saving any of it, for the
+month the money was needed elsewhere.
+
+- **A goal never holds more than its target.** Once it is full, the share it
+  would have taken goes to the goals that still have room, split between them in
+  proportion to the share of income each one takes. Money you hand to a full goal
+  yourself flows on the same way, and the dialog says where it will land while
+  you are still typing the amount. Where every goal is full, the remainder is not
+  set aside at all and the page says so — it is never quietly dropped.
+- A goal that is already over its target — topped up by hand, or had its target
+  lowered afterwards — gets its own banner offering to share the excess out.
+- **Reset progress** in the edit dialog empties a goal without deleting it: the
+  goal, its target and its share all stay, and you choose whether the money is
+  cleared or moved into your other goals. Nothing happens until you save.
+- Each contribution remembers the percentage it was cut at. Changing a goal's
   percentage therefore applies from that point on and leaves money already set
   aside exactly as it is — a decision made today does not restate what you
-  banked in March.
-- Delete an income entry and its share goes with it. Edit one and its share is
-  re-cut at the percentage it was originally set aside at, because correcting a
-  payslip is a correction to that payslip and nothing more.
+  banked in March. Income still waiting is re-quoted at the new share.
+- Delete an income entry and its share goes with it. Edit one that has already
+  been applied and its share is re-cut at the percentage it was originally set
+  aside at, because correcting a payslip is a correction to that payslip and
+  nothing more. Edit one that is still waiting and it is simply re-quoted.
 - Money you added by hand is never touched by any of that — it has no income
   behind it, so it survives every recalculation.
-- Imported CSV income is allocated exactly like income you typed in.
+- Imported CSV income queues up exactly like income you typed in.
 - The dialog tells you what a percentage works out to on a typical pay packet,
   and warns you if your goals between them would claim more than 100% of what
   comes in. Rings turn green at 100%, and taking money back out is stored as a
@@ -264,6 +286,8 @@ main.py                  entry point and CLI flags
 expman/
   db.py                  SQLite schema and all queries
   money.py               parsing and formatting of integer-cent amounts
+  allocation.py          who gets what: capped splits and overflow, no writes
+  journey.py             the three-step tracker in the sidebar
   recurrence.py          billing-cycle maths (month clamping, normalisation)
   csvio.py               issuer CSV profiles, parsing, duplicate keys, export
   theme.py               light/dark palettes, stylesheet, generated icons
@@ -293,8 +317,8 @@ tools/
 ## Checks
 
 ```bash
-python tools/smoke_ui.py        # 30 assertions
-python tools/smoke_features.py  # 105 assertions
+python tools/smoke_ui.py        # 64 assertions
+python tools/smoke_features.py  # 228 assertions
 ```
 
 The first covers add / edit / delete for expenses and subscriptions,
@@ -305,9 +329,12 @@ The second covers CSV detection and parsing for all three issuer layouts, the
 expense/income split, duplicate detection on both sides, export round-tripping,
 category rename / merge / delete, income entry and net calculation, goal
 contributions, withdrawals, completion and cascade deletion, the income-to-goal
-allocation rules (idempotency, rate-stability, manual money surviving a recut),
-and the delete-data flow including selective wipes, backups and the typed
-confirmation. Neither needs a display.
+rules (nothing moves until it is applied, idempotency, rate-stability, manual
+money surviving a recut), the overflow rules (a full goal takes only what fits,
+the rest reaches the goals with room, money with nowhere to go is reported
+rather than lost), resetting a goal, sharing out what is over target, the
+sidebar tracker, and the delete-data flow including selective wipes, backups and
+the typed confirmation. Neither needs a display.
 
 ```bash
 python tools/render_check.py shots/
@@ -347,6 +374,14 @@ when they are next opened instead. Search boxes are debounced, so typing costs
 one query rather than one per keystroke. Modal dialogs opened from a widget's
 own double-click handler are deferred by an event-loop turn, so a refresh can
 never destroy the widget whose handler is still unwinding.
+
+Splitting money between goals lives in one module, `allocation.py`, which
+returns plans and writes nothing. The page shows the plan and the database walks
+the same split to apply it, so what a button says it will do and what it does
+cannot drift apart. Every split hands out whole cents by largest remainder and
+adds up to exactly what went into it: what cannot be placed comes back as a
+figure the caller has to say something about, because the alternative is a
+rounding rule that loses somebody's money.
 
 Money is integer cents from the database up to the formatting layer, and the
 same decimal parser serves both the amount field and the CSV importer, so

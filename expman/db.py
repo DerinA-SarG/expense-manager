@@ -11,9 +11,10 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
+from .allocation import Bucket, buckets_from, share_out, split_contribution, split_income
 from .recurrence import advance
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 DEFAULT_CATEGORIES = [
     "Groceries",
@@ -104,6 +105,11 @@ CREATE TABLE IF NOT EXISTS income (
     -- decision, not a deletion: the row stays where it is, and the
     -- Overview goes on counting it.
     hidden       INTEGER NOT NULL DEFAULT 0,
+    -- When someone last pressed "Update goals" over this entry. NULL means its
+    -- share has not been set aside yet: the split is worked out and shown, and
+    -- nothing is written until it is applied. Goals move because a person moved
+    -- them, never as a side effect of logging a payslip.
+    allocated_at TEXT,
     created_at   TEXT    NOT NULL
 );
 
@@ -188,8 +194,10 @@ class Database:
             ("goal_contributions", "allocation_pct", "REAL NOT NULL DEFAULT 0"),
             ("expenses", "hidden", "INTEGER NOT NULL DEFAULT 0"),
             ("income", "hidden", "INTEGER NOT NULL DEFAULT 0"),
+            ("income", "allocated_at", "TEXT"),
             ("subscriptions", "hidden", "INTEGER NOT NULL DEFAULT 0"),
         )
+        added = set()
         for table, column, spec in additions:
             existing = {
                 row["name"]
@@ -197,6 +205,17 @@ class Database:
             }
             if column not in existing:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
+                added.add((table, column))
+
+        if ("income", "allocated_at") in added:
+            # Every income entry that predates this column was split the moment
+            # it was logged, back when that happened automatically. Leaving them
+            # unstamped would offer to set their share aside a second time, so
+            # they are marked as done at the point the column arrives.
+            self.conn.execute(
+                "UPDATE income SET allocated_at = created_at "
+                "WHERE allocated_at IS NULL"
+            )
 
         self._cascade_contributions_from_income()
 
@@ -748,7 +767,6 @@ class Database:
         description: str = "",
         notes: str = "",
         commit: bool = True,
-        allocate: bool = True,
     ) -> int:
         source = self.ensure_income_source(source, commit=commit)
         cur = self.conn.execute(
@@ -765,10 +783,10 @@ class Database:
             ),
         )
         income_id = int(cur.lastrowid)
-        # Done here rather than at each call site, so no path -- manual entry,
-        # CSV import, anything later -- can forget to set money aside.
-        if allocate:
-            self.allocate_income(income_id, commit=False)
+        # Nothing is set aside here. The entry lands with allocated_at NULL,
+        # the goals page works out what its share would come to and shows it,
+        # and the money only moves when someone presses "Update goals". No path
+        # -- manual entry, CSV import, anything later -- moves a goal on its own.
         if commit:
             self.conn.commit()
         return income_id
@@ -795,8 +813,12 @@ class Database:
                 int(income_id),
             ),
         )
-        # The amount may have changed, so the shares taken from it must be redone.
-        self.allocate_income(income_id, commit=False)
+        # The amount may have changed, so any share already taken from it has to
+        # be redone -- but only where there is one. An entry still waiting to be
+        # applied stays waiting, and its share is simply recalculated from the
+        # corrected figure the next time the plan is shown.
+        if self.is_allocated(income_id):
+            self.allocate_income(income_id, commit=False)
         self.conn.commit()
 
     def delete_income(self, ids) -> int:
@@ -1010,15 +1032,29 @@ class Database:
         )
         self.conn.commit()
 
+    def goal_buckets(self, pct_override: dict[int, float] | None = None) -> list[Bucket]:
+        """Every goal as a bucket: what it claims, and what room it has left.
+
+        The one place the rest of the app gets the picture a split is worked out
+        against, so a plan shown on screen and the plan that is written cannot
+        drift apart.
+        """
+        return buckets_from(self.goals(), pct_override)
+
     def redistribution_plan(self, goal_id: int) -> list[dict]:
         """Where a goal's savings would land if they were shared out instead.
 
         The freed money is treated the way an income entry is: the goals that
-        take a share of income take it in the same proportions. The proportions
-        are scaled to hand out all of it, though. Cutting it at the literal
-        percentages would leave whatever the goals do not claim between them
-        with nowhere to go, and money that is sitting in someone's savings today
-        would simply stop existing.
+        take a share of income take it in the same proportions, and a goal that
+        has reached its target takes none of it -- filling one goal past its
+        target to empty another would only move the problem.
+
+        The proportions are scaled to hand out all of it. Cutting it at the
+        literal percentages would leave whatever the goals do not claim between
+        them with nowhere to go, and money sitting in someone's savings today
+        would simply stop existing. Where every other goal is full there is
+        genuinely nowhere for it: the plan comes back short, and the caller says
+        so rather than inventing somewhere to put it.
 
         Nothing is written here -- the confirmation shows this before anything
         is deleted, and applies the same list afterwards.
@@ -1027,39 +1063,13 @@ class Database:
         if goal is None or goal["saved_cents"] <= 0:
             return []
 
-        others = [
-            g
-            for g in self.goals()
-            if g["id"] != int(goal_id) and float(g["allocation_pct"] or 0) > 0
-        ]
-        total_pct = sum(float(g["allocation_pct"]) for g in others)
-        if total_pct <= 0:
-            return []
-
-        amount = int(goal["saved_cents"])
-        shares = [
-            {
-                "id": g["id"],
-                "name": g["name"],
-                "exact": amount * float(g["allocation_pct"]) / total_pct,
-            }
-            for g in others
-        ]
-        for share in shares:
-            share["cents"] = int(share["exact"])
-
-        # Whole cents only, so the rounding loss is handed out a cent at a time,
-        # largest fraction first. The split has to add up to exactly what was
-        # freed: this is money being moved, not money being recalculated.
-        short = amount - sum(share["cents"] for share in shares)
-        by_fraction = sorted(shares, key=lambda s: s["exact"] - s["cents"], reverse=True)
-        for share in by_fraction[:short]:
-            share["cents"] += 1
-
+        others = [b for b in self.goal_buckets() if b.id != int(goal_id)]
+        placed, _ = share_out(int(goal["saved_cents"]), others)
+        by_id = {b.id: b for b in others}
         return [
-            {"id": s["id"], "name": s["name"], "cents": s["cents"]}
-            for s in shares
-            if s["cents"] > 0
+            {"id": gid, "name": by_id[gid].name, "cents": cents}
+            for gid, cents in placed.items()
+            if cents > 0
         ]
 
     def delete_goal(self, goal_id: int, redistribute: bool = False) -> list[dict]:
@@ -1161,19 +1171,59 @@ class Database:
 
     # ------------------------------------------ setting money aside from income
 
-    def _allocation_note(self, pct: float, income_row) -> str:
+    def _allocation_note(self, pct: float, income_row, share: int, placed: int) -> str:
+        """Say on the contribution itself where the money came from.
+
+        A goal that took more than its own percentage was handed the overflow
+        from a goal that had filled up, and one that took less had filled up
+        itself. Both are surprising a month later if the row only says "10% of
+        August pay", so the row says which it was.
+        """
         label = income_row["description"] or income_row["source"]
-        return f"{pct:g}% of {label}"
+        if pct <= 0:
+            return f"Overflow from {label}"
+        note = f"{pct:g}% of {label}"
+        if placed > share:
+            note += " + overflow"
+        elif placed < share:
+            note += " (target reached)"
+        return note
+
+    def _write_split(self, income_row, placed, pcts) -> int:
+        """Write one income entry's split out as contributions."""
+        made = 0
+        for goal_id, cents in placed.items():
+            if cents <= 0:
+                continue
+            pct = float(pcts.get(goal_id, 0))
+            share = round(int(income_row["amount_cents"]) * pct / 100)
+            self.add_contribution(
+                goal_id,
+                income_row["received_on"],
+                cents,
+                note=self._allocation_note(pct, income_row, share, cents),
+                income_id=int(income_row["id"]),
+                allocation_pct=pct,
+                commit=False,
+            )
+            made += 1
+        return made
 
     def allocate_income(self, income_id: int, commit: bool = True) -> int:
-        """Carve each goal's share out of one income entry.
+        """Re-cut an income entry whose share has already been set aside.
 
-        Any earlier automatic split of the same entry is cleared first, so
-        re-running this after an edit corrects the amounts instead of doubling
-        them. An entry that has been split before is re-cut at the rates it was
-        split at originally, not at whatever the goals say today: editing a
-        payslip is a correction to that payslip, and should not quietly restate
-        money set aside months ago under a share that has since changed.
+        This is the correction path, not the everyday one: new income waits for
+        someone to press "Update goals" (see `apply_pending`). It runs when an
+        entry that was already applied is edited and the amount its split came
+        out of has changed underneath it.
+
+        Any earlier split of the same entry is cleared first, so re-running this
+        corrects the amounts instead of doubling them. The entry is re-cut at
+        the rates it was split at originally, not at whatever the goals say
+        today: editing a payslip is a correction to that payslip, and should not
+        quietly restate money set aside months ago under a share that has since
+        changed. Full goals are still respected -- a correction spills into the
+        goals with room rather than pushing one past its target.
         """
         row = self.conn.execute(
             "SELECT * FROM income WHERE id = ?", (int(income_id),)
@@ -1193,31 +1243,295 @@ class Database:
             "DELETE FROM goal_contributions WHERE income_id = ?", (int(income_id),)
         )
 
-        made = 0
-        goals = self.conn.execute(
-            "SELECT id, name, allocation_pct FROM goals "
-            "WHERE allocation_pct > 0 OR id IN (%s)"
-            % (",".join("?" * len(prior)) or "NULL"),
-            tuple(prior),
-        ).fetchall()
-        for goal in goals:
-            pct = prior.get(int(goal["id"]), float(goal["allocation_pct"]))
-            share = round(row["amount_cents"] * pct / 100)
-            if share <= 0:
-                continue
-            self.add_contribution(
-                goal["id"],
-                row["received_on"],
-                share,
-                note=self._allocation_note(pct, row),
-                income_id=int(income_id),
-                allocation_pct=pct,
-                commit=False,
-            )
-            made += 1
+        # Read after the delete: the room a goal has is the room it has without
+        # this entry's own contributions, which are about to be written again.
+        buckets = self.goal_buckets(prior)
+        placed, _ = split_income(int(row["amount_cents"]), buckets)
+        made = self._write_split(row, placed, {b.id: b.pct for b in buckets})
         if commit:
             self.conn.commit()
         return made
+
+    # --------------------------------------------------- waiting to be applied
+
+    def is_allocated(self, income_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT allocated_at FROM income WHERE id = ?", (int(income_id),)
+        ).fetchone()
+        return bool(row and row["allocated_at"])
+
+    def pending_income(self):
+        """Income nobody has set a share of aside from yet, oldest first.
+
+        Oldest first because the plan is worked out in the order the money
+        actually arrived: an entry that filled a goal up in March is what makes
+        April's share spill into the next goal along.
+        """
+        return list(
+            self.conn.execute(
+                "SELECT * FROM income WHERE allocated_at IS NULL "
+                "ORDER BY received_on, id"
+            )
+        )
+
+    def pending_plan(self) -> dict:
+        """What pressing "Update goals" would do -- worked out, not done.
+
+        Every figure the goals page shows about money waiting to be set aside
+        comes from here, and `apply_pending` walks the same split to write it.
+        The two cannot disagree, which is the point: nobody should press a
+        button that does something other than what it said it would.
+        """
+        rows = self.pending_income()
+        buckets = self.goal_buckets()
+        by_goal: dict = {}
+        unplaced = 0
+        for row in rows:
+            placed, left = split_income(int(row["amount_cents"]), buckets)
+            for goal_id, cents in placed.items():
+                by_goal[goal_id] = by_goal.get(goal_id, 0) + cents
+            unplaced += left
+
+        named = {b.id: b for b in buckets}
+        shares = sorted(
+            (
+                {
+                    "id": goal_id,
+                    "name": named[goal_id].name,
+                    "pct": named[goal_id].pct,
+                    "cents": cents,
+                }
+                for goal_id, cents in by_goal.items()
+                if cents > 0
+            ),
+            key=lambda share: -share["cents"],
+        )
+        return {
+            "count": len(rows),
+            "income_cents": sum(int(r["amount_cents"]) for r in rows),
+            "total_cents": sum(share["cents"] for share in shares),
+            "unplaced_cents": unplaced,
+            "shares": shares,
+            "by_goal": by_goal,
+        }
+
+    def apply_pending(self) -> dict:
+        """Set aside what the plan says, and mark that income as dealt with.
+
+        One transaction: the contributions and the stamp saying they were made
+        land together or neither does. A half-applied batch would offer to set
+        the same money aside twice.
+        """
+        rows = self.pending_income()
+        buckets = self.goal_buckets()
+        pcts = {b.id: b.pct for b in buckets}
+        plan = self.pending_plan()
+        stamp = datetime.now().isoformat(timespec="seconds")
+        made = 0
+        with self.conn:
+            for row in rows:
+                placed, _ = split_income(int(row["amount_cents"]), buckets)
+                made += self._write_split(row, placed, pcts)
+                self.conn.execute(
+                    "UPDATE income SET allocated_at = ? WHERE id = ?",
+                    (stamp, int(row["id"])),
+                )
+        plan["contributions"] = made
+        return plan
+
+    def skip_pending(self) -> int:
+        """Mark waiting income as dealt with without setting anything aside.
+
+        Money that was spent rather than saved still has to leave the queue, or
+        the same entries are offered for ever. The income rows themselves are
+        untouched -- this only records that the question was answered.
+        """
+        cur = self.conn.execute(
+            "UPDATE income SET allocated_at = ? WHERE allocated_at IS NULL",
+            (datetime.now().isoformat(timespec="seconds"),),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    # ------------------------------------------------------ goals over target
+
+    def excess_plan(self) -> dict:
+        """What is sitting above a goal's target, and where it would go.
+
+        A goal can be holding more than it is aiming for: it filled up before
+        the split learned to stop at the target, or it was topped up by hand,
+        or its target was lowered afterwards. This is the offer to put that
+        money back to work -- each goal's excess shared out between the goals
+        that still have room, in proportion to the share of income they take.
+
+        A goal's excess is only taken out to the extent it can be placed
+        somewhere. Where everything else is full it stays where it is: money is
+        being moved here, not written off.
+        """
+        goals = self.goals()
+        buckets = self.goal_buckets()
+        named = {b.id: b for b in buckets}
+
+        moves = []
+        total = 0
+        for goal in goals:
+            target, saved = int(goal["target_cents"]), int(goal["saved_cents"])
+            if target <= 0 or saved <= target:
+                continue
+            excess = saved - target
+            placed, left = share_out(
+                excess, [b for b in buckets if b.id != int(goal["id"])]
+            )
+            moved = excess - left
+            if moved <= 0:
+                continue
+            moves.append(
+                {
+                    "id": int(goal["id"]),
+                    "name": goal["name"],
+                    "cents": moved,
+                    "stuck_cents": left,
+                    "shares": [
+                        {"id": gid, "name": named[gid].name, "cents": cents}
+                        for gid, cents in placed.items()
+                        if cents > 0
+                    ],
+                }
+            )
+            total += moved
+
+        over = [
+            {
+                "id": int(g["id"]),
+                "name": g["name"],
+                "cents": int(g["saved_cents"]) - int(g["target_cents"]),
+            }
+            for g in goals
+            if int(g["target_cents"]) > 0
+            and int(g["saved_cents"]) > int(g["target_cents"])
+        ]
+        return {
+            "over": over,
+            "excess_cents": sum(g["cents"] for g in over),
+            "moves": moves,
+            "total_cents": total,
+        }
+
+    def settle_excess(self) -> dict:
+        """Move what is over target into the goals that still have room.
+
+        The withdrawal and the contributions it pays for are one transaction:
+        the money is never in both places, nor in neither. It lands as ordinary
+        hand-entered contributions with no income behind them -- no income
+        arrived, so re-cutting a payslip must never touch it.
+        """
+        plan = self.excess_plan()
+        if not plan["moves"]:
+            return plan
+        today = date.today()
+        with self.conn:
+            for move in plan["moves"]:
+                self.add_contribution(
+                    move["id"],
+                    today,
+                    -move["cents"],
+                    note="Over target, moved to goals with room",
+                    commit=False,
+                )
+                for share in move["shares"]:
+                    self.add_contribution(
+                        share["id"],
+                        today,
+                        share["cents"],
+                        note=f"Overflow from {move['name']}",
+                        commit=False,
+                    )
+        return plan
+
+    # ------------------------------------------------- money added by a person
+
+    def contribution_plan(self, goal_id: int, amount_cents: int) -> dict:
+        """Where a hand-entered contribution would actually land.
+
+        The goal being paid into fills up first, and only what will not fit
+        moves on to the goals that take a share of income. A withdrawal is left
+        alone: taking money back out of a goal cannot overfill anything.
+        """
+        amount = int(amount_cents)
+        if amount <= 0:
+            return {"into_cents": amount, "shares": [], "unplaced_cents": 0}
+
+        buckets = self.goal_buckets()
+        named = {b.id: b for b in buckets}
+        placed, left = split_contribution(amount, goal_id, buckets)
+        return {
+            "into_cents": placed.get(int(goal_id), 0),
+            "shares": [
+                {"id": gid, "name": named[gid].name, "cents": cents}
+                for gid, cents in placed.items()
+                if gid != int(goal_id) and cents > 0
+            ],
+            "unplaced_cents": left,
+        }
+
+    def contribute(
+        self, goal_id: int, made_on, amount_cents: int, note: str = ""
+    ) -> dict:
+        """Put money into a goal, letting what will not fit flow on.
+
+        Anything that can be placed nowhere at all stays in the goal it was
+        meant for, even though that leaves it over target. Refusing it would
+        mean the app losing money someone really did put aside, and that is
+        never the lesser evil.
+        """
+        plan = self.contribution_plan(goal_id, amount_cents)
+        with self.conn:
+            if int(amount_cents) <= 0:
+                self.add_contribution(
+                    goal_id, made_on, int(amount_cents), note=note, commit=False
+                )
+                return plan
+
+            source = self.get_goal(goal_id)
+            label = source["name"] if source else "another goal"
+            into = plan["into_cents"] + plan["unplaced_cents"]
+            if into > 0:
+                self.add_contribution(goal_id, made_on, into, note=note, commit=False)
+            for share in plan["shares"]:
+                self.add_contribution(
+                    share["id"],
+                    made_on,
+                    share["cents"],
+                    note=(note + " -- " if note else "") + f"overflow from {label}",
+                    commit=False,
+                )
+        return plan
+
+    def reset_goal(self, goal_id: int, redistribute: bool = False) -> list:
+        """Take a goal back to nothing without deleting it.
+
+        The goal, its target and its share of income all stay exactly as they
+        are -- this clears what has been put into it, which is what starting one
+        again means. With redistribute set the money goes into the other goals
+        first rather than being dropped, on the same terms as deleting a goal,
+        and both halves are one transaction.
+        """
+        plan = self.redistribution_plan(goal_id) if redistribute else []
+        goal = self.get_goal(goal_id)
+        source = goal["name"] if goal else "a goal"
+        with self.conn:
+            for share in plan:
+                self.add_contribution(
+                    share["id"],
+                    date.today(),
+                    share["cents"],
+                    note=f"Moved from {source}",
+                    commit=False,
+                )
+            self.conn.execute(
+                "DELETE FROM goal_contributions WHERE goal_id = ?", (int(goal_id),)
+            )
+        return plan
 
     def list_contributions(self, goal_id: int) -> list[sqlite3.Row]:
         return list(

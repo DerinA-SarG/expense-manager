@@ -99,6 +99,13 @@ def build_demo_db(path: str | None = None, seed: int = 7) -> str:
     db.add_income(today - timedelta(days=3), 412, "Interest", "Interest paid", commit=False)
     db.conn.commit()
 
+    # Income does not move a goal on its own, so the demo stands in for someone
+    # who has kept up: everything logged so far has been set aside...
+    db.apply_pending()
+    # ...and then one more pay packet arrives, which is what puts the "ready to
+    # set aside" banner on the goals page with something real behind it.
+    db.add_income(today - timedelta(days=1), 186000, "Salary", "Fortnightly pay")
+
     # One goal takes no share of income, so it needs topping up by hand.
     winter = next(g for g in db.goals() if g["name"] == "Winter trip")
     db.add_contribution(winter["id"], today - timedelta(days=20), 62000, "Sold the old bike")

@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 from . import updates
 from .db import Database
 from .dialogs import DeleteEverythingDialog
+from .journey import JourneyPanel
 from .pages.expenses import ExpensesPage
 from .pages.goals import GoalsPage
 from .pages.income import IncomePage
@@ -110,10 +111,16 @@ class MainWindow(QWidget):
             on_add_expense=lambda: self.expenses.add_expense(),
             on_add_subscription=lambda: self.subscriptions.add_subscription(),
         )
-        self.expenses = ExpensesPage(db, self.pal, on_changed=self._data_changed)
+        self.expenses = ExpensesPage(
+            db, self.pal, on_changed=self._data_changed, on_step=self._step_done
+        )
         self.subscriptions = SubscriptionsPage(db, self.pal, on_changed=self._data_changed)
-        self.income = IncomePage(db, self.pal, on_changed=self._data_changed)
-        self.goals = GoalsPage(db, self.pal, on_changed=self._data_changed)
+        self.income = IncomePage(
+            db, self.pal, on_changed=self._data_changed, on_step=self._step_done
+        )
+        self.goals = GoalsPage(
+            db, self.pal, on_changed=self._data_changed, on_step=self._step_done
+        )
 
         # Order must match NAV.
         self.pages = (
@@ -171,6 +178,13 @@ class MainWindow(QWidget):
         self.nav_buttons.idClicked.connect(self._navigate)
 
         column.addStretch(1)
+
+        # The three steps of a sitting, under the places they are done in.
+        # Session-only: it is asking what has been done since the window
+        # opened, so it starts empty every launch.
+        self.journey = JourneyPanel(self.pal)
+        self.journey.navigate.connect(self.go_to)
+        column.addWidget(self.journey)
 
         # Everything that is not navigation lives behind one gear, so the
         # sidebar reads as a list of places rather than a settings panel.
@@ -346,6 +360,27 @@ class MainWindow(QWidget):
         # happened while it was hidden is picked up here.
         self.stack.currentWidget().refresh()
 
+    def go_to(self, index: int) -> None:
+        """Navigate from somewhere other than the nav buttons.
+
+        The buttons are an exclusive group, so the one for the page being shown
+        has to be ticked here too or the sidebar ends up highlighting a page
+        nobody is looking at.
+        """
+        button = self.nav_buttons.button(index)
+        if button is not None:
+            button.setChecked(True)
+        self._navigate(index)
+
+    def _step_done(self, key: str) -> None:
+        """A page reporting that one of the three steps has been done.
+
+        Pages say what happened rather than the panel going looking, because
+        only the page can tell logging a payslip apart from opening the dialog
+        and thinking better of it.
+        """
+        self.journey.complete(key)
+
     def _data_changed(self) -> None:
         """Something changed the data; refresh the page being looked at.
 
@@ -379,6 +414,7 @@ class MainWindow(QWidget):
             app.setStyleSheet(stylesheet(self.pal, assets))
             app.setWindowIcon(make_icon(self.pal["accent"], self.pal["surface"]))
         self.settings_button.setIcon(gear_icon(self.pal["text_secondary"]))
+        self.journey.set_palette(self.pal)
 
     def delete_everything(self) -> None:
         dialog = DeleteEverythingDialog(self.db, parent=self)

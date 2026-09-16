@@ -225,6 +225,11 @@ QPushButton#NavButton:checked {
     background: %(accent)s; color: %(accent_text)s; font-weight: 600;
 }
 
+QFrame#Journey {
+    background: transparent; border: none;
+    border-top: 1px solid %(border)s;
+}
+
 /* -------------------------------------------------------------------- cards */
 QFrame#Card {
     background: %(surface)s; border: 1px solid %(border)s; border-radius: 12px;

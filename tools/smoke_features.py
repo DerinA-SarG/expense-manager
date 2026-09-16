@@ -26,6 +26,7 @@ from expman.db import SCHEMA_VERSION, Database  # noqa: E402
 from expman.import_dialog import ImportDialog  # noqa: E402
 from expman.money import format_cents, parse_percent  # noqa: E402
 from expman.widgets import PercentField  # noqa: E402
+from expman.journey import STEPS as journey_steps  # noqa: E402
 from expman.pages import goals as goals_page  # noqa: E402
 from expman.pages import income as income_page  # noqa: E402
 
@@ -39,8 +40,17 @@ def check(label: str, condition: bool, detail: str = "") -> None:
 
 
 class StubDialog:
-    def __init__(self, values):
+    """Stands in for a form dialog: accepted, with these values.
+
+    `reset` and `reset_redistribute` are what the goal dialog reports back
+    about its reset button, and default to the answer "leave it alone".
+    """
+
+    def __init__(self, values, reset=False, reset_redistribute=False):
         self._values = values
+        self.reset = reset
+        self.reset_redistribute = reset_redistribute
+        self.reset_plan = []
 
     def __call__(self, *args, **kwargs):
         return self
@@ -442,15 +452,31 @@ def main() -> int:
     manual_goal = alloc_db.add_goal("Manual only", 50000, allocation_pct=0)
 
     pay = alloc_db.add_income(date(2026, 8, 1), 200000, "Salary", "August pay")
+    check(
+        "logging income moves no goal on its own",
+        all(g["saved_cents"] == 0 for g in alloc_db.goals()),
+        str([(g["name"], g["saved_cents"]) for g in alloc_db.goals()]),
+    )
+    plan = alloc_db.pending_plan()
+    quoted = {share["name"]: share["cents"] for share in plan["shares"]}
+    check("the entry is counted as waiting", plan["count"] == 1, str(plan["count"]))
+    check("the split is worked out and shown", plan["total_cents"] == 30000, str(plan))
+    check("each goal is quoted its own share", quoted == {"Emergency fund": 20000, "Trip": 10000},
+          str(quoted))
+    check("a 0% goal is not in the plan", "Manual only" not in quoted)
+
+    applied = alloc_db.apply_pending()
     saved = {g["name"]: g["saved_cents"] for g in alloc_db.goals()}
-    check("10% of income lands in the goal", saved["Emergency fund"] == 20000, str(saved))
+    check("applying the plan sets 10% of income aside", saved["Emergency fund"] == 20000, str(saved))
     check("a second goal takes its own share", saved["Trip"] == 10000, str(saved))
     check("a 0% goal is left alone", saved["Manual only"] == 0, str(saved))
+    check("what was applied matches what was shown", applied["total_cents"] == plan["total_cents"])
     check("total allocation is reported", alloc_db.total_allocation_pct() == 15)
+    check("nothing is left waiting", alloc_db.pending_plan()["count"] == 0)
 
-    alloc_db.allocate_income(pay)
+    alloc_db.apply_pending()
     check(
-        "re-allocating the same income does not double it",
+        "pressing update again sets nothing aside twice",
         alloc_db.get_goal(emergency)["saved_cents"] == 20000,
         str(alloc_db.get_goal(emergency)["saved_cents"]),
     )
@@ -458,8 +484,9 @@ def main() -> int:
     alloc_db.add_contribution(emergency, date(2026, 8, 5), 7500, "birthday cash")
     alloc_db.update_income(pay, date(2026, 8, 1), 300000, "Salary", "August pay, corrected")
     g = alloc_db.get_goal(emergency)
-    check("editing income re-cuts its share", g["from_income_cents"] == 30000, str(g))
+    check("editing applied income re-cuts its share", g["from_income_cents"] == 30000, str(g))
     check("a hand-entered top-up survives the recut", g["saved_cents"] == 30000 + 7500, str(g))
+    check("and it is not offered again", alloc_db.pending_plan()["count"] == 0)
 
     before = alloc_db.get_goal(emergency)["from_income_cents"]
     alloc_db.update_goal(emergency, "Emergency fund", 500000, allocation_pct=20)
@@ -468,13 +495,36 @@ def main() -> int:
           f"{before} -> {after}")
 
     alloc_db.add_income(date(2026, 8, 15), 100000, "Freelance", "side job")
+    check(
+        "income logged after the change is quoted at the new share",
+        alloc_db.pending_plan()["by_goal"][emergency] == 20000,
+        str(alloc_db.pending_plan()["by_goal"]),
+    )
+    alloc_db.apply_pending()
     g = alloc_db.get_goal(emergency)
     check(
-        "the new share applies to income logged after the change",
+        "the new share applies once it is set aside",
         g["from_income_cents"] == before + 20000,
         str(g["from_income_cents"]),
     )
     check("the manual top-up is still untouched", g["saved_cents"] - g["from_income_cents"] == 7500)
+
+    # An entry nobody has applied yet is simply re-quoted from the new figure.
+    waiting = alloc_db.add_income(date(2026, 8, 20), 50000, "Freelance", "another job")
+    alloc_db.update_income(waiting, date(2026, 8, 20), 80000, "Freelance", "another job, fixed")
+    check("editing an entry that is still waiting leaves it waiting",
+          alloc_db.is_allocated(waiting) is False)
+    check(
+        "and re-quotes it from the corrected amount",
+        alloc_db.pending_plan()["income_cents"] == 80000,
+        str(alloc_db.pending_plan()["income_cents"]),
+    )
+    held = sum(g["saved_cents"] for g in alloc_db.goals())
+    income_before = alloc_db.income_total()
+    alloc_db.skip_pending()
+    check("skipping sets nothing aside", sum(g["saved_cents"] for g in alloc_db.goals()) == held)
+    check("and clears the queue", alloc_db.pending_plan()["count"] == 0)
+    check("and leaves the income itself alone", alloc_db.income_total() == income_before)
 
     # A correction to an old payslip is a correction to that payslip: it is
     # re-cut at the rate it was originally split at, not today's.
@@ -494,7 +544,7 @@ def main() -> int:
     )
     check("and still leaves the manual money", g["saved_cents"] == 20000 + 7500, str(g))
 
-    # A CSV import is just many income rows, so it must allocate the same way.
+    # A CSV import is just many income rows, so it must queue up the same way.
     before = alloc_db.get_goal(trip)["saved_cents"]
     alloc_db.add_income_bulk(
         [
@@ -503,8 +553,11 @@ def main() -> int:
             for i in range(3)
         ]
     )
+    check("imported income waits with the rest", alloc_db.pending_plan()["count"] == 3,
+          str(alloc_db.pending_plan()["count"]))
+    alloc_db.apply_pending()
     check(
-        "imported income is allocated too",
+        "imported income is set aside too",
         alloc_db.get_goal(trip)["saved_cents"] == before + 3 * 5000,
         str(alloc_db.get_goal(trip)["saved_cents"]),
     )
@@ -516,7 +569,205 @@ def main() -> int:
     check("median income is available for the hint", alloc_db.typical_income() == 100000,
           str(alloc_db.typical_income()))
 
+    # ------------------------------------------------------- when a goal fills up
+    print("\nWhen a goal fills up")
+    spill_db = Database(os.path.join(workdir, "spill.db"))
+    nearly = spill_db.add_goal("Nearly there", 10000, allocation_pct=20)
+    big = spill_db.add_goal("Big one", 1000000, allocation_pct=30)
+    slow = spill_db.add_goal("Slow", 1000000, allocation_pct=10)
+
+    spill_db.add_income(date(2026, 8, 1), 100000, "Salary", "pay")
+    spill = spill_db.pending_plan()
+    landed = {share["name"]: share["cents"] for share in spill["shares"]}
+    check("a full goal takes only what fits", landed["Nearly there"] == 10000, str(landed))
+    check(
+        "what will not fit goes to the goals that take a share",
+        landed["Big one"] == 30000 + 7500 and landed["Slow"] == 10000 + 2500,
+        str(landed),
+    )
+    check("the whole share of income is still set aside", spill["total_cents"] == 60000,
+          str(spill["total_cents"]))
+    check("with nothing left unplaced", spill["unplaced_cents"] == 0)
+
+    spill_db.apply_pending()
+    check(
+        "no goal is left over its target",
+        all(g["saved_cents"] <= g["target_cents"] for g in spill_db.goals()),
+        str([(g["name"], g["saved_cents"], g["target_cents"]) for g in spill_db.goals()]),
+    )
+    notes = [
+        r["note"]
+        for r in spill_db.conn.execute("SELECT note FROM goal_contributions")
+    ]
+    check("the overflow says so on the contribution", any("overflow" in n for n in notes),
+          str(notes))
+    check("and the goal that filled up says that", any("target reached" in n for n in notes),
+          str(notes))
+
+    # Money handed to a full goal by hand follows the same rule.
+    hand_plan = spill_db.contribution_plan(nearly, 5000)
+    check("a hand-entered amount stops at the target too", hand_plan["into_cents"] == 0,
+          str(hand_plan))
+    check(
+        "and the rest is offered to the goals with room",
+        sum(share["cents"] for share in hand_plan["shares"]) == 5000,
+        str(hand_plan),
+    )
+    held = {g["name"]: g["saved_cents"] for g in spill_db.goals()}
+    spill_db.contribute(nearly, date(2026, 8, 2), 5000, "bonus")
+    now = {g["name"]: g["saved_cents"] for g in spill_db.goals()}
+    check("which is where it actually lands", now["Nearly there"] == held["Nearly there"],
+          str(now))
+    check("every cent of it still saved", sum(now.values()) == sum(held.values()) + 5000,
+          str(now))
+    spill_db.contribute(big, date(2026, 8, 3), -2000, "took it back")
+    check(
+        "a withdrawal is left alone",
+        spill_db.get_goal(big)["saved_cents"] == now["Big one"] - 2000,
+        str(spill_db.get_goal(big)["saved_cents"]),
+    )
+
+    # With every goal full there is nowhere for it, and that is said out loud
+    # rather than the money being quietly dropped.
+    full_db = Database(os.path.join(workdir, "full.db"))
+    only = full_db.add_goal("Only goal", 5000, allocation_pct=50)
+    full_db.add_income(date(2026, 8, 1), 100000, "Salary", "pay")
+    full = full_db.pending_plan()
+    check("a lone goal takes only what fits", full["total_cents"] == 5000, str(full))
+    check("and the rest is reported, not lost", full["unplaced_cents"] == 45000, str(full))
+    full_db.apply_pending()
+    check("the goal stops exactly at its target",
+          full_db.get_goal(only)["saved_cents"] == 5000,
+          str(full_db.get_goal(only)["saved_cents"]))
+
+    # ----------------------------------------------------- goals already over
+    print("\nGoals already over target")
+    over_db = Database(os.path.join(workdir, "over.db"))
+    overfull = over_db.add_goal("Overfull", 10000, allocation_pct=20)
+    room = over_db.add_goal("Room", 100000, allocation_pct=30)
+    more_room = over_db.add_goal("More room", 100000, allocation_pct=10)
+    over_db.add_contribution(overfull, date(2026, 8, 1), 16000, "saved before the rule")
+
+    excess = over_db.excess_plan()
+    going = {share["name"]: share["cents"] for move in excess["moves"] for share in move["shares"]}
+    check("money above a target is spotted", excess["excess_cents"] == 6000, str(excess))
+    check("and offered to the goals with room",
+          going == {"Room": 4500, "More room": 1500}, str(going))
+
+    before_total = sum(g["saved_cents"] for g in over_db.goals())
+    over_db.settle_excess()
+    after = {g["name"]: g["saved_cents"] for g in over_db.goals()}
+    check("settling leaves the goal exactly at its target", after["Overfull"] == 10000, str(after))
+    check("its money is not lost", sum(after.values()) == before_total, str(after))
+    check("it lands where the plan said",
+          after["Room"] == 4500 and after["More room"] == 1500, str(after))
+    check("and there is nothing left over", over_db.excess_plan()["moves"] == [])
+
+    # ------------------------------------------------------- resetting a goal
+    print("\nResetting a goal")
+    reset_db = Database(os.path.join(workdir, "reset.db"))
+    keep = reset_db.add_goal("Keep me", 100000, allocation_pct=25)
+    elsewhere = reset_db.add_goal("Elsewhere", 100000, allocation_pct=10)
+    reset_db.add_contribution(keep, date(2026, 8, 1), 20000, "saved")
+
+    reset_db.reset_goal(keep)
+    goal = reset_db.get_goal(keep)
+    check("a reset empties the goal", goal["saved_cents"] == 0, str(goal["saved_cents"]))
+    check("its contributions go with it", goal["contributions"] == 0)
+    check("but the goal itself stays", goal["name"] == "Keep me")
+    check("with its target and its share intact",
+          goal["target_cents"] == 100000 and goal["allocation_pct"] == 25, str(dict(goal)))
+    check("and the other goals are untouched",
+          reset_db.get_goal(elsewhere)["saved_cents"] == 0)
+
+    reset_db.add_contribution(keep, date(2026, 8, 2), 20000, "saved again")
+    total_before = sum(g["saved_cents"] for g in reset_db.goals())
+    moved = reset_db.reset_goal(keep, redistribute=True)
+    check("resetting with the money kept hands it on",
+          sum(g["saved_cents"] for g in reset_db.goals()) == total_before,
+          str([(g["name"], g["saved_cents"]) for g in reset_db.goals()]))
+    check("it lands in the goal that takes a share",
+          reset_db.get_goal(elsewhere)["saved_cents"] == 20000,
+          str(reset_db.get_goal(elsewhere)["saved_cents"]))
+    check("and the reset goal starts again at nothing",
+          reset_db.get_goal(keep)["saved_cents"] == 0)
+    check("the money says where it came from",
+          moved and moved[0]["name"] == "Elsewhere", str(moved))
+
+    # The same thing through the dialog the user actually sees.
+    page.db = db
+    dialog_goal = db.add_goal("Through the dialog", 100000, allocation_pct=0)
+    db.add_contribution(dialog_goal, today, 30000, "saved")
+    page.refresh()
+    page._select(dialog_goal)
+    goals_page.GoalDialog = StubDialog(
+        {"name": "Through the dialog", "target_cents": 100000,
+         "allocation_pct": 0.0, "notes": ""},
+        reset=True,
+    )
+    page.edit_selected()
+    check("the edit dialog can reset a goal",
+          db.get_goal(dialog_goal)["saved_cents"] == 0,
+          str(db.get_goal(dialog_goal)["saved_cents"]))
+    check("and the goal survives it", db.get_goal(dialog_goal) is not None)
+    db.delete_goal(dialog_goal)
+    page.refresh()
+
+    # ------------------------------------------------- the steps in the sidebar
+    print("\nThe steps in the sidebar")
+    panel = window.journey
+    panel.reset()
+    # Something for the last step to actually do: with no goal taking a share,
+    # updating them would be a no-op, and a no-op is not a step done.
+    step_goal = db.add_goal("Step check", 500000, allocation_pct=10)
+    check("a session starts with nothing ticked", panel.done == set(), str(panel.done))
+    check("the first step is the one being asked for", panel.track.current == 0,
+          str(panel.track.current))
+
+    income_page.IncomeDialog = StubDialog(
+        {
+            "received_on": today,
+            "amount_cents": 180000,
+            "source": "Salary",
+            "description": "step check",
+            "notes": "",
+        }
+    )
+    window.income.add_income()
+    check("logging income ticks its step", "income" in panel.done, str(panel.done))
+    check("and the next one is asked for", panel.track.current == 1, str(panel.track.current))
+
+    window.goals.apply_pending()
+    check("updating goals ticks the last step", "goals" in panel.done, str(panel.done))
+    check("the rail fills as steps are ticked", panel.track._target_fill == 1.0,
+          str(panel.track._target_fill))
+    window.income.add_income()
+    check("doing something twice is not an error", "income" in panel.done)
+
+    check(
+        "the money the step set aside is really there",
+        db.get_goal(step_goal)["saved_cents"] == 18000,
+        str(db.get_goal(step_goal)["saved_cents"]),
+    )
+    db.delete_goal(step_goal)
+    window.income.table.selectAll()
+    window.income.delete_selected()
+    page.refresh()
+
+    window.go_to(0)
+    check("a step click navigates", window.stack.currentIndex() == 0)
+    check("and the sidebar button follows it", window.nav_buttons.button(0).isChecked())
+
+    from expman.journey import JourneyPanel  # noqa: E402
+
+    fresh = JourneyPanel(window.pal)
+    check("a new session starts empty again", fresh.done == set(), str(fresh.done))
+    check("every step points at a real page",
+          all(0 <= index < len(window.pages) for _, _, index in journey_steps),
+          str(journey_steps))
+
     # ------------------------------------------------- leaving rows out
+
     print("\nHiding rows from a page's figures")
     hide_db = Database(os.path.join(workdir, "hide.db"))
     keep = hide_db.add_expense(date(2026, 8, 1), 5000, "Groceries", "counted")
@@ -578,6 +829,7 @@ def main() -> int:
     legacy = Database(legacy_path)
     legacy_goal = legacy.add_goal("Old goal", 100000, allocation_pct=10)
     legacy_income = legacy.add_income(date(2026, 7, 1), 200000, "Salary", "old pay")
+    legacy.apply_pending()
     legacy.add_contribution(legacy_goal, date(2026, 7, 2), 5000, "by hand")
     legacy.conn.executescript(
         """

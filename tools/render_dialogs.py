@@ -17,7 +17,9 @@ from expman.app import MainWindow  # noqa: E402
 from expman.db import Database  # noqa: E402
 from expman.dialogs import (  # noqa: E402
     CategoryManagerDialog,
+    ContributionDialog,
     ExpenseDialog,
+    GoalDialog,
     SubscriptionDialog,
 )
 from expman.import_dialog import ImportDialog  # noqa: E402
@@ -73,6 +75,11 @@ def main() -> int:
     db.add_expense("2026-01-04", 4200, "Groceries", "Weekly shop")
     db.add_expense("2026-01-06", 1850, "Dining", "Lunch")
 
+    # A full goal and a hungry one, so the dialogs below have a spill to explain.
+    full_goal = db.add_goal("New headphones", 20000, allocation_pct=10)
+    db.add_goal("Emergency fund", 500000, allocation_pct=25)
+    db.add_contribution(full_goal, "2026-01-07", 20000, "Saved up")
+
     for theme in ("dark", "light"):
         pal = palette(theme)
         app.setStyleSheet(stylesheet(pal, prepare_assets(pal, os.path.join(out, "assets"))))
@@ -92,6 +99,32 @@ def main() -> int:
         importer = ImportDialog(db, pal)
         importer.load_path(sample_csv)
         shoot(importer, os.path.join(out, f"dialog_import_{theme}.png"))
+
+        # Editing a goal that has something in it: the reset button is only
+        # offered here, and is shown armed so the warning line is in the shot.
+        goal = db.get_goal(full_goal)
+        editor = GoalDialog(
+            db.currency,
+            goal=goal,
+            typical_income=180000,
+            other_pct=25.0,
+            reset_plan=db.redistribution_plan(full_goal),
+        )
+        editor.reset = True
+        editor.reset_redistribute = True
+        editor._show_reset_state()
+        editor.resize(460, editor.sizeHint().height())
+        shoot(editor, os.path.join(out, f"dialog_goal_{theme}.png"))
+
+        # More than the goal can hold, so the hint has to say where the rest goes.
+        contribution = ContributionDialog(
+            goal["name"],
+            db.currency,
+            plan=lambda cents: db.contribution_plan(full_goal, cents),
+        )
+        contribution.amount_field.setText("120.00")
+        contribution.resize(440, contribution.sizeHint().height())
+        shoot(contribution, os.path.join(out, f"dialog_contribution_{theme}.png"))
 
     # First run: a brand-new database with nothing in it at all.
     fresh = os.path.join(tempfile.mkdtemp(prefix="expman_fresh_"), "fresh.db")

@@ -118,18 +118,27 @@ class FormDialog(QDialog):
 
         self._outer.addStretch(1)
 
-        footer = QHBoxLayout()
-        footer.setSpacing(8)
-        footer.addStretch(1)
+        self.footer = QHBoxLayout()
+        self.footer.setSpacing(8)
+        self.footer.addStretch(1)
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
         self.save_button = QPushButton("Save")
         self.save_button.setObjectName("Primary")
         self.save_button.setDefault(True)
         self.save_button.clicked.connect(self._on_save)
-        footer.addWidget(cancel)
-        footer.addWidget(self.save_button)
-        self._outer.addLayout(footer)
+        self.footer.addWidget(cancel)
+        self.footer.addWidget(self.save_button)
+        self._outer.addLayout(self.footer)
+
+    def add_footer_button(self, widget: QWidget) -> None:
+        """Put a button on the left of the footer, away from Save and Cancel.
+
+        Somewhere for an action that is not "finish this form" -- the stretch
+        between keeps it from sitting next to the button someone is reaching
+        for when they mean to save.
+        """
+        self.footer.insertWidget(0, widget)
 
     def add_row(self, label: str, field: QWidget, hint: str = "") -> QWidget:
         block = QVBoxLayout()
@@ -797,7 +806,15 @@ class IncomeDialog(FormDialog):
 class GoalDialog(FormDialog):
     """A savings goal: a target, and the share of income that feeds it."""
 
-    def __init__(self, currency="$", goal=None, typical_income=0, other_pct=0.0, parent=None):
+    def __init__(
+        self,
+        currency="$",
+        goal=None,
+        typical_income=0,
+        other_pct=0.0,
+        reset_plan=None,
+        parent=None,
+    ):
         super().__init__("Edit goal" if goal else "New savings goal", parent, width=460)
         self.currency = currency
         self.amount_cents = 0
@@ -805,6 +822,14 @@ class GoalDialog(FormDialog):
         # Used only to make the percentage concrete while you are choosing it.
         self.typical_income = typical_income
         self.other_pct = other_pct
+        # Where this goal's money would go if it were emptied, worked out by the
+        # page before the dialog opened. Shown, never acted on from here.
+        self.reset_plan = reset_plan or []
+        self.saved_cents = int(goal["saved_cents"]) if goal else 0
+        # Read by the page after the dialog is accepted: nothing is cleared
+        # until the form is saved, so cancelling really does cancel.
+        self.reset = False
+        self.reset_redistribute = False
 
         self.name_field = QLineEdit(goal["name"] if goal else "")
         self.name_field.setPlaceholderText("Emergency fund, new laptop, holiday...")
@@ -835,8 +860,98 @@ class GoalDialog(FormDialog):
         self.notes_field.setFixedHeight(64)
         self.add_row("Notes", self.notes_field)
 
+        # Only offered when editing, and only when there is progress to clear.
+        self.reset_note = QLabel("")
+        self.reset_note.setObjectName("ErrorLabel")
+        self.reset_note.setWordWrap(True)
+        self.reset_note.setVisible(False)
+        self.form.addWidget(self.reset_note)
+
+        self.reset_button = QPushButton("Reset progress...")
+        self.reset_button.setToolTip(
+            "Empty this goal and start it again, keeping the goal itself"
+        )
+        self.reset_button.clicked.connect(self._toggle_reset)
+        self.reset_button.setVisible(bool(goal) and self.saved_cents != 0)
+        self.add_footer_button(self.reset_button)
+
         self._refresh_allocation_hint()
         self.name_field.setFocus()
+
+    # ------------------------------------------------------------------ reset
+
+    def _toggle_reset(self) -> None:
+        """Arm or disarm the reset. Nothing happens until Save."""
+        if self.reset:
+            self.reset = False
+            self.reset_redistribute = False
+            self._show_reset_state()
+            return
+
+        held = format_cents(self.saved_cents, self.currency)
+        ask = QMessageBox(self)
+        ask.setWindowTitle("Reset progress")
+        ask.setIcon(QMessageBox.Icon.Warning)
+        ask.setText(f"Start this goal again from {format_cents(0, self.currency)}?")
+        told = (
+            f"Its {held} and every contribution behind it are cleared. The goal, "
+            "its target and its share of income all stay as they are.\n\nYour "
+            "expenses and income are untouched -- this only clears the record of "
+            "setting the money aside."
+        )
+        move = None
+        if self.reset_plan:
+            told += (
+                "\n\nOr keep the money: tick the box and it is shared out between "
+                "the goals that take a share of income and still have room."
+            )
+            move = QCheckBox(f"Put its {held} into your other goals")
+            move.setChecked(True)
+            move.setToolTip(
+                "\n".join(
+                    f"{share['name']}  {format_cents(share['cents'], self.currency)}"
+                    for share in self.reset_plan
+                )
+            )
+            ask.setCheckBox(move)
+        ask.setInformativeText(told)
+        ask.setStandardButtons(
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes
+        )
+        ask.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if ask.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        self.reset = True
+        self.reset_redistribute = bool(move is not None and move.isChecked())
+        self._show_reset_state()
+
+    def _show_reset_state(self) -> None:
+        """Say plainly what saving is now going to do, and offer to take it back."""
+        if not self.reset:
+            self.reset_note.setVisible(False)
+            self.reset_button.setText("Reset progress...")
+            return
+
+        held = format_cents(self.saved_cents, self.currency)
+        if self.reset_redistribute:
+            moved = sum(share["cents"] for share in self.reset_plan)
+            where = ", ".join(share["name"] for share in self.reset_plan)
+            note = (
+                f"Saving will empty this goal and move "
+                f"{format_cents(moved, self.currency)} to {where}."
+            )
+            left = self.saved_cents - moved
+            if left > 0:
+                note += (
+                    f" The other {format_cents(left, self.currency)} has nowhere "
+                    "to go -- every other goal is full -- so it is cleared."
+                )
+        else:
+            note = f"Saving will clear this goal's {held}."
+        self.reset_note.setText(note)
+        self.reset_note.setVisible(True)
+        self.reset_button.setText("Keep progress")
 
     def _refresh_allocation_hint(self, *_) -> None:
         # Runs on every keystroke, and half-typed input is not an error worth
@@ -861,6 +976,10 @@ class GoalDialog(FormDialog):
                 f"On a typical {format_cents(self.typical_income, self.currency)} "
                 f"that is {format_cents(share, self.currency)}."
             )
+        parts.append(
+            "Once it reaches its target the rest of its share goes to your "
+            "other goals instead."
+        )
         combined = self.other_pct + pct
         if combined > 100:
             parts.append(
@@ -892,10 +1011,14 @@ class GoalDialog(FormDialog):
 class ContributionDialog(FormDialog):
     """Money moved into a goal, or taken back out of it."""
 
-    def __init__(self, goal_name: str, currency="$", parent=None):
+    def __init__(self, goal_name: str, currency="$", plan=None, parent=None):
         super().__init__(f"Add to {goal_name}", parent)
         self.currency = currency
         self.amount_cents = 0
+        self.goal_name = goal_name
+        # Given the amount, says where it would land. The dialog never moves
+        # anything itself -- it shows the same plan the page goes on to apply.
+        self.plan = plan
 
         self.date_field = _date_edit(date.today())
         self.amount_field = QLineEdit()
@@ -915,7 +1038,71 @@ class ContributionDialog(FormDialog):
         self.note_field.setPlaceholderText("Optional")
         self.add_row("Note", self.note_field)
 
+        self.landing_hint = QLabel("")
+        self.landing_hint.setObjectName("Muted")
+        self.landing_hint.setWordWrap(True)
+        self.form.addWidget(self.landing_hint)
+
+        self.amount_field.textChanged.connect(self._refresh_landing_hint)
+        self.withdraw_field.toggled.connect(self._refresh_landing_hint)
+        self._refresh_landing_hint()
+
         self.amount_field.setFocus()
+
+    def _refresh_landing_hint(self, *_) -> None:
+        """Show where the money goes before it goes there.
+
+        Runs on every keystroke, so half-typed input is not an error worth
+        shouting about -- the hint goes quiet until the number is usable.
+        """
+        if self.plan is None:
+            return
+        try:
+            amount = parse_amount(self.amount_field.text())
+        except ValueError:
+            self.landing_hint.setText("")
+            return
+        if self.withdraw_field.isChecked():
+            self.landing_hint.setText(
+                f"{format_cents(amount, self.currency)} comes back out of "
+                f"{self.goal_name}."
+            )
+            return
+
+        landing = self.plan(amount)
+        shares = landing["shares"]
+        stuck = landing["unplaced_cents"]
+        if not shares and not stuck:
+            self.landing_hint.setText(
+                f"All of it goes into {self.goal_name}."
+            )
+            return
+
+        into = format_cents(landing["into_cents"], self.currency)
+        where = ", ".join(
+            f"{share['name']} {format_cents(share['cents'], self.currency)}"
+            for share in shares
+        )
+        if shares and landing["into_cents"] <= 0:
+            # Nothing fits at all: saying "$0.00 fills it" is true and useless.
+            text = (
+                f"{self.goal_name} is already at its target, so all of it goes "
+                f"to your other goals: {where}."
+            )
+        elif shares:
+            text = (
+                f"{into} fills {self.goal_name}. The rest goes to your other "
+                f"goals: {where}."
+            )
+        else:
+            text = f"{into} fills {self.goal_name}."
+        if stuck:
+            text += (
+                f" {format_cents(stuck, self.currency)} has nowhere else to go -- "
+                f"every goal is full -- so it stays in {self.goal_name}, above "
+                "its target."
+            )
+        self.landing_hint.setText(text)
 
     def validate(self) -> None:
         self.amount_cents = parse_amount(self.amount_field.text())
